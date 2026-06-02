@@ -1,0 +1,269 @@
+{% extends 'base.html' %}
+{% block title %}apifuzz – scan {{ scan_id }}{% endblock %}
+{% block content %}
+<section class="panel">
+  <div class="results-header">
+    <div>
+      <h1>Scan <code>{{ scan_id }}</code></h1>
+      <p class="muted">
+        Target <code>{{ snapshot.base_url or '—' }}</code> · {{ snapshot.endpoint_count }} endpoints ·
+        {{ snapshot.categories | length }} payload classes
+      </p>
+    </div>
+    <div class="results-actions">
+      <span id="status-pill" class="pill pill-{{ snapshot.status }}">{{ snapshot.status }}</span>
+      {% if not embed %}
+      <a class="btn btn-secondary" href="/scan/{{ scan_id }}/export">Download HTML report</a>
+      <a class="btn btn-secondary" href="/scan/{{ scan_id }}/export.csv">Download CSV</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="progress-wrap">
+    <div class="progress">
+      <div id="progress-bar" class="progress-bar"
+           style="width: {% if snapshot.total_requests %}{{ (snapshot.completed_requests * 100 / snapshot.total_requests) | round(1) }}{% else %}0{% endif %}%"></div>
+    </div>
+    <div class="progress-meta">
+      <span id="progress-count">{{ snapshot.completed_requests }} / {{ snapshot.total_requests }} requests</span>
+      <span id="progress-endpoint" class="muted">{{ snapshot.current_endpoint }}</span>
+    </div>
+    <div class="progress-meta">
+      <span id="failed-count" class="muted">{{ snapshot.failed_requests or 0 }} request(s) failed</span>
+      <span class="muted">Misconfig detection: <strong id="misconfig-flag">{{ 'on' if snapshot.detect_misconfig else 'off' }}</strong></span>
+    </div>
+  </div>
+
+  <div id="diagnostics-wrap" {% if not snapshot.warnings and not snapshot.errors %}style="display:none"{% endif %}>
+    <div id="warnings-panel" class="diagnostics" {% if not snapshot.warnings %}style="display:none"{% endif %}>
+      <strong>Diagnostics</strong>
+      <ul id="warnings-list">
+        {% for w in snapshot.warnings %}<li>{{ w }}</li>{% endfor %}
+      </ul>
+    </div>
+    <details id="errors-panel" class="diagnostics diagnostics-error" {% if not snapshot.errors %}style="display:none"{% endif %}>
+      <summary><strong>Request errors</strong> (<span id="errors-count">{{ snapshot.errors|length if snapshot.errors else 0 }}</span> unique)</summary>
+      <ul id="errors-list">
+        {% for e in snapshot.errors %}<li>{{ e }}</li>{% endfor %}
+      </ul>
+    </details>
+  </div>
+
+  <div id="severity-cards" class="severity-cards">
+    {% for sev in ['critical', 'high', 'medium', 'low', 'info'] %}
+    <div class="sev-card sev-{{ sev }}">
+      <div class="sev-label">{{ sev }}</div>
+      <div class="sev-count" data-sev="{{ sev }}">{{ snapshot.severity_counts.get(sev, 0) }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Findings</h2>
+    <div class="filters">
+      <label>Filter:
+        <select id="sev-filter">
+          <option value="">All severities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="info">Info</option>
+        </select>
+      </label>
+      <label>Sort:
+        <select id="sev-sort">
+          <option value="desc" selected>Severity: high → low</option>
+          <option value="asc">Severity: low → high</option>
+        </select>
+      </label>
+    </div>
+  </div>
+  <div id="findings"></div>
+  <p id="empty" class="muted" style="display:none">No findings yet.</p>
+</section>
+
+<script>
+  const SCAN_ID = {{ scan_id | tojson }};
+  const CATEGORY_LABELS = {{ category_labels | tojson }};
+  const EMBED = {{ 'true' if embed else 'false' }};
+  const INITIAL_FINDINGS = {% if embed %}{{ findings | tojson }}{% else %}null{% endif %};
+  const INITIAL_SNAPSHOT = {{ snapshot | tojson }};
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+
+  function renderFindings(findings) {
+    const container = document.getElementById('findings');
+    const empty = document.getElementById('empty');
+    const filter = document.getElementById('sev-filter').value;
+    const direction = (document.getElementById('sev-sort') || {}).value || 'desc';
+    let filtered = filter ? findings.filter(f => f.severity === filter) : findings.slice();
+    filtered.sort(function (a, b) {
+      const ar = SEV_RANK[a.severity] !== undefined ? SEV_RANK[a.severity] : 99;
+      const br = SEV_RANK[b.severity] !== undefined ? SEV_RANK[b.severity] : 99;
+      if (ar !== br) return direction === 'asc' ? br - ar : ar - br;
+      // Tie-break: endpoint, then title.
+      if (a.endpoint !== b.endpoint) return a.endpoint < b.endpoint ? -1 : 1;
+      if (a.title !== b.title) return a.title < b.title ? -1 : 1;
+      return 0;
+    });
+    if (!filtered.length) {
+      container.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    container.innerHTML = filtered.map((f, idx) => {
+      const headerLabel = (CATEGORY_LABELS[f.category] || f.category);
+      const reqHeaders = Object.entries(f.request_headers || {})
+        .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`).join('\n');
+      const respHeaders = Object.entries(f.response_headers || {})
+        .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(v)}`).join('\n');
+      const bodyLen = f.response_body ? f.response_body.length : 0;
+      const truncatedNote = f.response_truncated
+        ? ` <span class="muted">(truncated at 1\u00A0MiB)</span>` : '';
+      const rawId = `raw-req-${idx}`;
+      return `
+        <details class="finding sev-${escapeHtml(f.severity)}">
+          <summary>
+            <span class="badge sev-${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
+            <span class="finding-title">${escapeHtml(f.title)}</span>
+            <span class="finding-meta">
+              <code>${escapeHtml(f.method)} ${escapeHtml(f.endpoint)}</code>
+              · <span class="muted">${escapeHtml(headerLabel)}</span>
+              · param <code>${escapeHtml(f.parameter)}</code> in ${escapeHtml(f.location)}
+            </span>
+          </summary>
+          <div class="finding-body">
+            <dl class="kv">
+              <dt>Technique</dt><dd>${escapeHtml(f.technique)}</dd>
+              <dt>Evidence</dt><dd>${escapeHtml(f.evidence)}</dd>
+              <dt>Status</dt><dd>${escapeHtml(f.status_code)} (${escapeHtml(f.response_time_ms)} ms)</dd>
+              <dt>Request URL</dt><dd><code>${escapeHtml(f.request_url)}</code></dd>
+              <dt>Payload</dt><dd><pre>${escapeHtml(f.payload)}</pre></dd>
+              ${f.raw_request ? `<dt>Raw HTTP request <button type="button" class="copy-btn" data-copy-target="${rawId}">Copy for Burp Repeater</button> <span class="muted">(paste into Repeater → Raw tab)</span></dt><dd><pre id="${rawId}" class="raw-request">${escapeHtml(f.raw_request)}</pre></dd>` : ''}
+              ${reqHeaders ? `<dt>Request headers</dt><dd><pre>${escapeHtml(reqHeaders)}</pre></dd>` : ''}
+              ${f.request_body ? `<dt>Request body</dt><dd><pre>${escapeHtml(f.request_body)}</pre></dd>` : ''}
+              ${respHeaders ? `<dt>Response headers</dt><dd><pre class="response-headers">${escapeHtml(respHeaders)}</pre></dd>` : ''}
+              ${f.response_body ? `<dt>Response body <span class="muted">(${bodyLen.toLocaleString()} chars)</span>${truncatedNote}</dt><dd><pre class="response-body">${escapeHtml(f.response_body)}</pre></dd>` : ''}
+            </dl>
+          </div>
+        </details>
+      `;
+    }).join('');
+
+    // Wire up copy buttons (event delegation so it works after every re-render).
+    container.querySelectorAll('.copy-btn').forEach(function (btn) {
+      btn.addEventListener('click', async function (evt) {
+        evt.preventDefault();
+        const id = btn.getAttribute('data-copy-target');
+        const pre = document.getElementById(id);
+        if (!pre) return;
+        const text = pre.textContent || '';
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(text);
+          } else {
+            // Fallback for older browsers / non-secure contexts.
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+          }
+          const original = btn.textContent;
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(function () { btn.textContent = original; btn.classList.remove('copied'); }, 1400);
+        } catch (_) {
+          btn.textContent = 'Copy failed';
+          setTimeout(function () { btn.textContent = 'Copy for Burp Repeater'; }, 1800);
+        }
+      });
+    });
+  }
+
+  function applySnapshot(snap) {
+    const pill = document.getElementById('status-pill');
+    pill.textContent = snap.status;
+    pill.className = 'pill pill-' + snap.status;
+    const total = snap.total_requests || 0;
+    const done = snap.completed_requests || 0;
+    const pct = total ? Math.min(100, (done * 100 / total)) : 0;
+    document.getElementById('progress-bar').style.width = pct.toFixed(1) + '%';
+    document.getElementById('progress-count').textContent = `${done} / ${total} requests`;
+    document.getElementById('progress-endpoint').textContent = snap.current_endpoint || '';
+    for (const sev of ['critical', 'high', 'medium', 'low', 'info']) {
+      const node = document.querySelector(`.sev-count[data-sev="${sev}"]`);
+      if (node) node.textContent = (snap.severity_counts && snap.severity_counts[sev]) || 0;
+    }
+    const failed = snap.failed_requests || 0;
+    const failedNode = document.getElementById('failed-count');
+    if (failedNode) failedNode.textContent = `${failed} request(s) failed`;
+    const flag = document.getElementById('misconfig-flag');
+    if (flag) flag.textContent = snap.detect_misconfig ? 'on' : 'off';
+
+    const wrap = document.getElementById('diagnostics-wrap');
+    const warningsPanel = document.getElementById('warnings-panel');
+    const errorsPanel = document.getElementById('errors-panel');
+    const warningsList = document.getElementById('warnings-list');
+    const errorsList = document.getElementById('errors-list');
+    const errorsCount = document.getElementById('errors-count');
+    const warnings = snap.warnings || [];
+    const errors = snap.errors || [];
+    if (warningsList) warningsList.innerHTML = warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('');
+    if (errorsList) errorsList.innerHTML = errors.map(e => `<li>${escapeHtml(e)}</li>`).join('');
+    if (errorsCount) errorsCount.textContent = String(errors.length);
+    if (warningsPanel) warningsPanel.style.display = warnings.length ? '' : 'none';
+    if (errorsPanel) errorsPanel.style.display = errors.length ? '' : 'none';
+    if (wrap) wrap.style.display = (warnings.length || errors.length) ? '' : 'none';
+  }
+
+  async function poll() {
+    try {
+      const resp = await fetch(`/scan/${SCAN_ID}/status`);
+      if (!resp.ok) return;
+      const data = await resp.json();
+      applySnapshot(data);
+      renderFindings(data.findings || []);
+      if (data.status === 'running' || data.status === 'pending') {
+        setTimeout(poll, 1200);
+      }
+    } catch (_) {
+      setTimeout(poll, 3000);
+    }
+  }
+
+  function _onFilterOrSortChange() {
+    if (EMBED) {
+      renderFindings(INITIAL_FINDINGS || []);
+    } else {
+      // We don't have a cached copy of findings in non-embed mode, so just
+      // re-run the poll which will re-render with the new sort/filter.
+      poll();
+    }
+  }
+  document.getElementById('sev-filter').addEventListener('change', _onFilterOrSortChange);
+  const _sortEl = document.getElementById('sev-sort');
+  if (_sortEl) _sortEl.addEventListener('change', _onFilterOrSortChange);
+
+  if (EMBED) {
+    applySnapshot(INITIAL_SNAPSHOT);
+    renderFindings(INITIAL_FINDINGS || []);
+  } else {
+    poll();
+  }
+</script>
+{% endblock %}

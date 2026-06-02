@@ -1,0 +1,23 @@
+# venv / installed deps
+.venv/
+venv/
+
+# byte-compiled
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# macOS metadata
+.DS_Store
+
+# Local scan artefacts
+/scans/
+*.csv
+*.html.bak
+
+# Editor scratch
+.vscode/
+.idea/
+*.swp
+*~

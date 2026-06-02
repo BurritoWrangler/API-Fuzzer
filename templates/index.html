@@ -1,0 +1,184 @@
+{% extends 'base.html' %}
+{% block title %}apifuzz – new scan{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Run a new API fuzz</h1>
+  <p class="muted">Upload an OpenAPI 2.0 / 3.x spec (JSON or YAML), point at the target base URL,
+  pick the vulnerability classes to exercise, and launch.</p>
+
+  {% if error %}
+  <div class="alert alert-error">{{ error }}</div>
+  {% endif %}
+
+  <form action="/scan" method="post" enctype="multipart/form-data" class="scan-form">
+    <div class="field">
+      <label for="spec">OpenAPI spec file</label>
+      <input type="file" id="spec" name="spec" accept=".json,.yaml,.yml" required>
+      <span class="hint">Max 5&nbsp;MB. JSON or YAML.</span>
+    </div>
+
+    <div class="field">
+      <label for="base_url">Target base URL</label>
+      <input type="url" id="base_url" name="base_url" placeholder="https://api.example.com"
+             value="{{ prev_base_url or '' }}" required>
+    </div>
+
+    <div class="field">
+      <label for="auth_header">Authorization header (optional)</label>
+      <input type="text" id="auth_header" name="auth_header" placeholder="Bearer eyJhbGciOi..."
+             value="{{ prev_auth_header or '' }}">
+      <span class="hint">Sent on every request. Use the full value (e.g. <code>Bearer …</code>).</span>
+    </div>
+
+    <fieldset class="field">
+      <legend>User-Agent</legend>
+      <div class="row">
+        <div class="field" style="margin-bottom:0">
+          <label for="user_agent_mode">Mode</label>
+          <select id="user_agent_mode" name="user_agent_mode">
+            {% set selected_ua = prev_user_agent_mode or 'default' %}
+            {% for slug, label in ua_presets.items() %}
+            <option value="{{ slug }}" {% if selected_ua == slug %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+            <option value="random" {% if selected_ua == 'random' %}selected{% endif %}>Random rotation (obfuscation)</option>
+            <option value="custom" {% if selected_ua == 'custom' %}selected{% endif %}>Custom…</option>
+          </select>
+          <span class="hint">Static modes pin the UA for the whole scan. <em>Random rotation</em> picks a fresh browser-shaped UA on every request.</span>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="user_agent_custom">Custom value (only when mode is &ldquo;Custom…&rdquo;)</label>
+          <input type="text" id="user_agent_custom" name="user_agent_custom"
+                 maxlength="512" autocomplete="off"
+                 placeholder="Mozilla/5.0 (…) MyAgent/1.0"
+                 value="{{ prev_user_agent_custom or '' }}">
+          <span class="hint">Max 512 chars. No newlines.</span>
+        </div>
+      </div>
+    </fieldset>
+
+    <div class="row">
+      <div class="field">
+        <label for="timeout">Per-request timeout (s)</label>
+        <input type="number" id="timeout" name="timeout" value="{{ prev_timeout or '10' }}" min="1" max="120" step="1">
+      </div>
+      <div class="field">
+        <label for="max_requests">Request budget</label>
+        <input type="number" id="max_requests" name="max_requests" value="{{ prev_max_requests or '2000' }}" min="50" max="20000" step="50">
+        <label class="check unlimited-budget">
+          <input type="checkbox" id="unlimited_budget" name="unlimited_budget" value="on">
+          <span>Unlimited — run every check against every endpoint</span>
+        </label>
+        <span class="hint">Safety cap. Reduce for large specs, or check <em>Unlimited</em> for a full sweep.</span>
+      </div>
+    </div>
+
+    <div class="select-all-row">
+      <button type="button" id="select-all-options" class="btn btn-secondary">Select all scan options</button>
+      <button type="button" id="deselect-all-options" class="btn btn-secondary">Clear all</button>
+      <span class="hint">Toggles every checkbox below (vulnerability classes, misconfig detection, extended checks).</span>
+    </div>
+
+    <fieldset class="field">
+      <legend>Vulnerability classes</legend>
+      <div class="checks scan-options">
+        {% for slug, label in categories %}
+          {% if slug != 'misconfiguration' %}
+          <label class="check">
+            <input type="checkbox" name="categories" value="{{ slug }}"
+                   {% if prev_categories is none or slug in prev_categories %}checked{% endif %}>
+            <span>{{ label }}</span>
+          </label>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    <fieldset class="field">
+      <legend>Misconfiguration detection</legend>
+      <label class="check scan-options">
+        <input type="checkbox" name="detect_misconfig" value="on"
+               {% if prev_detect_misconfig is not defined or prev_detect_misconfig %}checked{% endif %}>
+        <span>Detect common misconfigurations (security headers, CORS, cookies, exposed paths, dangerous methods)</span>
+      </label>
+      <span class="hint">Adds preflight + per-endpoint observational checks. Does not consume the payload budget.</span>
+    </fieldset>
+
+    <fieldset class="field">
+      <legend>Extended checks (v1.2)</legend>
+      <div class="checks scan-options">
+        <label class="check"><input type="checkbox" name="extra_mass_assignment" value="on" checked><span>Mass assignment</span></label>
+        <label class="check"><input type="checkbox" name="extra_hpp" value="on" checked><span>HTTP parameter pollution</span></label>
+        <label class="check"><input type="checkbox" name="extra_method_override" value="on" checked><span>HTTP method override</span></label>
+        <label class="check"><input type="checkbox" name="extra_content_type_confusion" value="on" checked><span>Content-Type confusion</span></label>
+        <label class="check"><input type="checkbox" name="extra_open_redirect" value="on" checked><span>Open redirect (focused)</span></label>
+        <label class="check"><input type="checkbox" name="extra_canary_reflection" value="on" checked><span>Canary reflection map</span></label>
+        <label class="check"><input type="checkbox" name="schema_violations" value="on" checked><span>Schema-violation negative tests</span></label>
+        <label class="check"><input type="checkbox" name="jwt_attacks" value="on" checked><span>JWT attacks (alg:none, weak HMAC, kid)</span></label>
+        <label class="check"><input type="checkbox" name="rate_limit_probe" value="on" checked><span>Rate-limit probe</span></label>
+        <label class="check"><input type="checkbox" name="api_version_inventory" value="on" checked><span>API version inventory</span></label>
+      </div>
+      <span class="hint">These run once per scan or per endpoint and do not consume the payload budget.</span>
+    </fieldset>
+
+    <div class="actions">
+      <button type="submit" class="btn btn-primary">Run Fuzz</button>
+    </div>
+  </form>
+</section>
+
+<script>
+  // Select-all / Clear-all wiring for every scan-option checkbox.
+  (function () {
+    function toggleAll(checked) {
+      document.querySelectorAll('.scan-options input[type="checkbox"]').forEach(function (el) {
+        el.checked = checked;
+      });
+    }
+    var selectBtn = document.getElementById('select-all-options');
+    var clearBtn = document.getElementById('deselect-all-options');
+    if (selectBtn) selectBtn.addEventListener('click', function () { toggleAll(true); });
+    if (clearBtn) clearBtn.addEventListener('click', function () { toggleAll(false); });
+
+    // Unlimited-budget UI: disable the numeric input when checked so it's
+    // visually obvious the value won't be used.
+    var maxInput = document.getElementById('max_requests');
+    var unlimited = document.getElementById('unlimited_budget');
+    function syncBudget() {
+      if (!maxInput || !unlimited) return;
+      maxInput.disabled = unlimited.checked;
+      maxInput.style.opacity = unlimited.checked ? '0.5' : '1';
+    }
+    if (unlimited) unlimited.addEventListener('change', syncBudget);
+    syncBudget();
+
+    // User-Agent: enable the custom text input only when mode is 'custom'.
+    var uaMode = document.getElementById('user_agent_mode');
+    var uaCustom = document.getElementById('user_agent_custom');
+    function syncUACustom() {
+      if (!uaMode || !uaCustom) return;
+      var isCustom = uaMode.value === 'custom';
+      uaCustom.disabled = !isCustom;
+      uaCustom.style.opacity = isCustom ? '1' : '0.5';
+      if (isCustom) {
+        uaCustom.required = true;
+      } else {
+        uaCustom.required = false;
+      }
+    }
+    if (uaMode) uaMode.addEventListener('change', syncUACustom);
+    syncUACustom();
+  })();
+</script>
+
+<section class="panel panel-muted">
+  <h2>What this does</h2>
+  <ul class="bullets">
+    <li>Parses your spec and enumerates every endpoint, parameter, and request body.</li>
+    <li>Injects payloads into each parameter location (query, path, header, body).</li>
+    <li>Runs observational checks for transport, security headers, CORS, cookies, server disclosure, exposed paths, and dangerous HTTP methods.</li>
+    <li>Records findings ranked Critical → High → Medium → Low → Info, deduplicated per endpoint.</li>
+    <li>Exports a standalone HTML report you can share.</li>
+  </ul>
+  <p class="warn">Only fuzz targets you are authorized to test.</p>
+</section>
+{% endblock %}

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}apifuzz{% endblock %}</title>
+  {% if embed %}
+  <style>{{ inline_css|safe }}</style>
+  {% else %}
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  {% endif %}
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">⌁</span>
+      <span class="brand-name">apifuzz</span>
+      <span class="brand-tag">API fuzzing for Kali</span>
+      <span class="brand-version">v{{ app_version }}</span>
+    </div>
+    {% if not embed %}<a class="topbar-link" href="/">New scan</a>{% endif %}
+  </header>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
