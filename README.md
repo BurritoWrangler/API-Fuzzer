@@ -1,5 +1,13 @@
-# apifuzz — v1.9
+# apifuzz — v1.10
 
+v1.10 adds:
+- **Payload obfuscation (WAF evasion)** — new `obfuscator.py` module with four modes selectable on the new-scan form:
+  - **Off** (default, preserves v1.9 behaviour)
+  - **Basic** — percent-encode every reserved byte
+  - **Aggressive** — per-category transform stack: SQL inline comments + random case for SQLi, mixed-case tag for XSS, `${IFS}` substitution + `${x}` shell-variable splits for command injection, double-URL-encoded slashes for path traversal, URL encoding for NoSQL / LDAP / XPath, etc.
+  - **Random** — rotates a fresh transform per request (defeats burst-rate and signature-cache rules)
+  - The transformed value is what the fuzzer sends AND what the dashboard / CSV / raw_request blob displays, so what you see is what hit the wire.
+- **Bugfix: category checkboxes are now pre-checked on first load.** v1.9's `{% if prev_categories is none %}` only matched explicit `None`, but on a fresh `GET /` the variable is *undefined* in Jinja, so no class was selected and many users silently submitted scans with their intended classes unchecked. Fixed to treat `is not defined` as a first-load signal.
 v1.9 adds:
 - **Type-juggling payload class** that inspects each parameter's declared schema type in the OpenAPI spec (`boolean`, `integer`, `number`, `string`) and sends a curated list of “looks plausible but probably wrong” values per type. Boolean parameters get probed with `1`, `0`, `"yes"`, `"on"`, `[]`, `{}`, quoted-string `"true"`/`"false"`, etc.; integer/number parameters get `Infinity`, `NaN`, `9223372036854775808`, `0x41`, `"abc"`, scientific overflow, and friends; string parameters get a small set of edge values (empty, NUL byte, 10 KiB).
 - The new analyzer branch only flags 2xx responses to clearly type-mismatched payloads (e.g. boolean parameter accepting `"yes"`), keeping noise low — numeric values that parse cleanly are skipped, and most string-shaped payloads aren't flagged at all unless they're edge cases.

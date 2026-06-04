@@ -19,6 +19,7 @@ from analyzer import Finding, analyze, severity_counts, sort_findings, url_with_
 from payloads import payloads_for, payloads_for_type
 from spec_parser import Endpoint, Parameter
 from http_session import UASession
+import obfuscator
 import misconfig
 import extra_checks
 import jwt_checks
@@ -42,6 +43,9 @@ class ScanConfig:
     # curl, googlebot, ios-safari, android-chrome, random, custom.
     user_agent_mode: str = "default"
     user_agent_custom: str = ""
+    # v1.10: payload obfuscation policy for WAF evasion.
+    # off | basic | aggressive | random. See obfuscator.py for details.
+    payload_obfuscation: str = "off"
     # Extended-check toggles (all default ON; user can disable in the UI).
     extra_mass_assignment: bool = True
     extra_hpp: bool = True
@@ -505,7 +509,14 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                     # v1.9: type_juggling resolves its payload list per parameter type.
                     if category == "type_juggling":
                         items = payloads_for_type(target.get("schema_type", "string"))
-                    for payload, technique in items:
+                    for raw_payload, technique in items:
+                        # v1.10: apply WAF-evasion obfuscation before sending.
+                        # The transformed value is what hits the wire AND what
+                        # we record on the Finding's `payload` field, so the
+                        # raw_request preview shows the actual bytes.
+                        payload = obfuscator.obfuscate(
+                            raw_payload, category, cfg.payload_obfuscation
+                        )
                         if cfg.max_requests > 0 and sent >= cfg.max_requests:
                             _add_warning(
                                 scan,

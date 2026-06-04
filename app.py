@@ -24,14 +24,16 @@ from flask import Flask, abort, jsonify, render_template, request, Response
 from analyzer import sort_findings
 from fuzzer import ScanConfig, ScanState, run_scan
 from http_session import UA_PRESET_LABELS, UA_PRESETS
+from obfuscator import MODE_LABELS as OBFUSCATION_LABELS, MODES as OBFUSCATION_MODES, MODE_OFF
 from payloads import CATEGORY_LABELS, available_categories
 from spec_parser import SpecParseError, parse_spec_text
 
 
 UA_MODES = set(UA_PRESETS.keys()) | {"random", "custom"}
+OBFUSCATION_MODES_SET = set(OBFUSCATION_MODES)
 
 
-__version__ = "1.9"
+__version__ = "1.10"
 
 
 app = Flask(__name__)
@@ -82,6 +84,7 @@ def index():
         categories=[(c, CATEGORY_LABELS[c]) for c in available_categories()],
         detect_misconfig=True,
         ua_presets=UA_PRESET_LABELS,
+        obfuscation_modes=OBFUSCATION_LABELS,
     )
 
 
@@ -148,6 +151,10 @@ def start_scan():
         if len(ua_custom) > 512:
             return _error_response("Custom User-Agent is too long (max 512 chars)."), 400
 
+    obf_mode = (request.form.get("payload_obfuscation") or MODE_OFF).lower().strip()
+    if obf_mode not in OBFUSCATION_MODES_SET:
+        return _error_response(f"Unknown obfuscation mode: {obf_mode!r}."), 400
+
     def _on(name: str) -> bool:
         return request.form.get(name, "on").lower() in ("on", "true", "1", "yes")
 
@@ -165,6 +172,7 @@ def start_scan():
         detect_misconfig=detect_misconfig,
         user_agent_mode=ua_mode,
         user_agent_custom=ua_custom,
+        payload_obfuscation=obf_mode,
         extra_mass_assignment=_on("extra_mass_assignment"),
         extra_hpp=_on("extra_hpp"),
         extra_method_override=_on("extra_method_override"),
@@ -285,7 +293,9 @@ def _error_response(msg: str):
         in ("on", "true", "1", "yes"),
         prev_user_agent_mode=(request.form.get("user_agent_mode") or "default").lower().strip(),
         prev_user_agent_custom=(request.form.get("user_agent_custom") or "").strip(),
+        prev_payload_obfuscation=(request.form.get("payload_obfuscation") or MODE_OFF).lower().strip(),
         ua_presets=UA_PRESET_LABELS,
+        obfuscation_modes=OBFUSCATION_LABELS,
     )
 
 
