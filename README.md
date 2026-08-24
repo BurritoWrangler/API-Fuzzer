@@ -104,6 +104,26 @@ If `setup.sh` complains that `python3-venv` is missing:
 sudo apt update && sudo apt install -y python3-venv
 ```
 
+## Development and tests
+
+Install the test dependencies into the project virtual environment:
+
+```
+./setup.sh
+.venv/bin/python -m pip install -r requirements-dev.txt
+```
+
+Run the same syntax, test, and coverage checks enforced by CI:
+
+```
+.venv/bin/python -m compileall -q .
+.venv/bin/python -m pytest --cov --cov-report=term-missing --cov-fail-under=65
+```
+
+The test suite uses fake HTTP sessions and does not contact live targets.
+GitHub Actions runs it on Python 3.9 through 3.13 for every push and pull
+request.
+
 ## Run
 
 ```

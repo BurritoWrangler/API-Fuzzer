@@ -38,6 +38,8 @@ __version__ = "1.10"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB spec cap
+MAX_CONCURRENT_SCANS = max(1, int(os.environ.get("APIFUZZ_MAX_CONCURRENT_SCANS", "4")))
+SCAN_TTL_SECONDS = max(60, int(os.environ.get("APIFUZZ_SCAN_TTL_SECONDS", "86400")))
 
 
 @app.context_processor
@@ -75,6 +77,29 @@ def _validate_auth_header(raw: Optional[str]) -> Tuple[Optional[str], Optional[s
 # Thread-safe scan registry.
 SCANS: Dict[str, ScanState] = {}
 SCANS_LOCK = threading.Lock()
+
+def _prune_scans_locked(now: Optional[float] = None) -> None:
+    """Drop terminal scans after the configured in-memory retention period.
+
+    The caller must hold ``SCANS_LOCK``.
+    """
+    import time
+
+    current = time.time() if now is None else now
+    expired = [
+        scan_id
+        for scan_id, state in SCANS.items()
+        if state.status in ("completed", "failed")
+        and state.finished_at
+        and current - state.finished_at >= SCAN_TTL_SECONDS
+    ]
+    for scan_id in expired:
+        del SCANS[scan_id]
+
+
+def _active_scan_count_locked() -> int:
+    """Return active scan count while the caller holds ``SCANS_LOCK``."""
+    return sum(1 for state in SCANS.values() if state.status in ("pending", "running"))
 
 
 @app.route("/")
@@ -137,7 +162,7 @@ def start_scan():
     if not categories:
         return _error_response("Select at least one vulnerability class."), 400
 
-    detect_misconfig = request.form.get("detect_misconfig", "on").lower() in ("on", "true", "1", "yes")
+    detect_misconfig = request.form.get("detect_misconfig", "").lower() in ("on", "true", "1", "yes")
 
     ua_mode = (request.form.get("user_agent_mode") or "default").lower().strip()
     if ua_mode not in UA_MODES:
@@ -156,11 +181,18 @@ def start_scan():
         return _error_response(f"Unknown obfuscation mode: {obf_mode!r}."), 400
 
     def _on(name: str) -> bool:
-        return request.form.get(name, "on").lower() in ("on", "true", "1", "yes")
+        # Unchecked HTML checkboxes are omitted from the form entirely.
+        return request.form.get(name, "").lower() in ("on", "true", "1", "yes")
 
     scan_id = uuid.uuid4().hex[:12]
     state = ScanState(scan_id=scan_id)
     with SCANS_LOCK:
+        _prune_scans_locked()
+        if _active_scan_count_locked() >= MAX_CONCURRENT_SCANS:
+            return _error_response(
+                f"Maximum concurrent scans ({MAX_CONCURRENT_SCANS}) reached. "
+                "Wait for a running scan to finish."
+            ), 429
         SCANS[scan_id] = state
 
     cfg = ScanConfig(
@@ -270,6 +302,7 @@ def scan_export_csv(scan_id: str):
 
 def _get_scan(scan_id: str) -> ScanState:
     with SCANS_LOCK:
+        _prune_scans_locked()
         state = SCANS.get(scan_id)
     if state is None:
         abort(404)
@@ -287,9 +320,9 @@ def _error_response(msg: str):
         prev_timeout=(request.form.get("timeout") or "10").strip(),
         prev_max_requests=(request.form.get("max_requests") or "2000").strip(),
         prev_categories=set(request.form.getlist("categories")) or None,
-        prev_detect_misconfig=request.form.get("detect_misconfig", "on").lower()
+        prev_detect_misconfig=request.form.get("detect_misconfig", "").lower()
         in ("on", "true", "1", "yes"),
-        detect_misconfig=request.form.get("detect_misconfig", "on").lower()
+        detect_misconfig=request.form.get("detect_misconfig", "").lower()
         in ("on", "true", "1", "yes"),
         prev_user_agent_mode=(request.form.get("user_agent_mode") or "default").lower().strip(),
         prev_user_agent_custom=(request.form.get("user_agent_custom") or "").strip(),

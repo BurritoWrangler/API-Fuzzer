@@ -15,10 +15,21 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from analyzer import Finding, analyze, severity_counts, sort_findings, url_with_query
+from analyzer import Finding, analyze, severity_counts, sort_findings
 from payloads import payloads_for, payloads_for_type
 from spec_parser import Endpoint, Parameter
 from http_session import UASession
+from models import (
+    AuthProfile,
+    DEFAULT_SCAN_MODE,
+    PreparedRequest,
+    RequestLedger,
+    RequestTemplate,
+    SafetyLevel,
+    normalize_scan_mode,
+    safety_allowed,
+)
+from request_builder import build_request, substitute_path
 import obfuscator
 import misconfig
 import extra_checks
@@ -57,6 +68,10 @@ class ScanConfig:
     schema_violations: bool = True
     rate_limit_probe: bool = True
     api_version_inventory: bool = True
+    # Phase 0: scan execution mode (passive | safe_active | intrusive).
+    # Defaults to safe_active; intrusive behavior remains unsupported until a
+    # later check provides explicit opt-in and cleanup semantics.
+    scan_mode: str = DEFAULT_SCAN_MODE
 
 
 @dataclass
@@ -77,10 +92,23 @@ class ScanState:
     warnings: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
     detect_misconfig: bool = True
+    # Phase 0: scan mode, cancellation, request ledger, and richer progress.
+    scan_mode: str = DEFAULT_SCAN_MODE
+    cancelled: bool = False
+    planned_requests: int = 0
+    skipped_requests: int = 0
+    budget_exhausted: int = 0
+    ledger: RequestLedger = field(default_factory=RequestLedger, repr=False)
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def request_cancel(self) -> None:
+        """Request the scan to stop at the next loop boundary."""
+        self.cancel_event.set()
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
+            ledger_summary = self.ledger.summary()
             return {
                 "scan_id": self.scan_id,
                 "status": self.status,
@@ -99,6 +127,15 @@ class ScanState:
                 "warnings": list(self.warnings),
                 "errors": list(self.errors),
                 "detect_misconfig": self.detect_misconfig,
+                # Phase 0 additions (legacy keys above are preserved).
+                "scan_mode": self.scan_mode,
+                "cancelled": self.cancelled,
+                "planned_requests": self.planned_requests,
+                "skipped_requests": self.skipped_requests,
+                "budget_exhausted": self.budget_exhausted,
+                "ledger_count": ledger_summary["ledger_count"],
+                "sent_requests": ledger_summary["sent"],
+                "succeeded_requests": ledger_summary["succeeded"],
             }
 
 
@@ -113,16 +150,16 @@ def _placeholder_value(param: Parameter) -> Any:
 
 
 def _build_path(template: str, path_params: Dict[str, Any]) -> str:
-    out = template
-    for name, value in path_params.items():
-        out = out.replace("{" + name + "}", requests.utils.quote(str(value), safe=""))
-    return out
+    # Delegate to request_builder so path substitution has a single source of
+    # truth; kept as a backward-compatible helper for tests and internal calls.
+    return substitute_path(template, path_params)
 
 
 def _baseline_request(
     session: requests.Session,
     endpoint: Endpoint,
     cfg: ScanConfig,
+    scan: Optional[ScanState] = None,
 ) -> Dict[str, Any]:
     """Run a benign request and capture latency + response metadata.
 
@@ -133,6 +170,9 @@ def _baseline_request(
         set_cookies      List[str]
         url              str (absolute)
         error            Optional[str]
+
+    Phase 0: routes construction through request_builder and records a ledger
+    entry so the baseline is accounted for in the scan's request accounting.
     """
     out: Dict[str, Any] = {
         "latency_ms": None,
@@ -142,47 +182,94 @@ def _baseline_request(
         "url": "",
         "error": None,
     }
+    prepared: Optional[PreparedRequest] = None
     try:
-        url, headers, params, body = _benign_request(endpoint, cfg)
-        out["url"] = url
+        template = _endpoint_template(endpoint, cfg)
+        prepared = build_request(template)
+        out["url"] = prepared.url
+        kwargs: Dict[str, Any] = {
+            "headers": prepared.headers,
+            "params": prepared.query_params or None,
+            "timeout": cfg.timeout,
+            "allow_redirects": False,
+        }
+        if endpoint.has_body and prepared.body is not None:
+            kwargs["data"] = prepared.body
         t0 = time.perf_counter()
-        resp = session.request(
-            method=endpoint.method,
-            url=url,
-            headers=headers,
-            params=params,
-            json=body if endpoint.has_body and endpoint.consumes_json else None,
-            data=body if endpoint.has_body and not endpoint.consumes_json else None,
-            timeout=cfg.timeout,
-            allow_redirects=False,
-        )
-        out["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        resp = session.request(method=endpoint.method, url=prepared.url, **kwargs)
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        out["latency_ms"] = elapsed
         out["status_code"] = resp.status_code
         out["response_headers"] = dict(resp.headers)
         out["set_cookies"] = misconfig.extract_set_cookies(resp)
+        _ledger(
+            scan,
+            prepared=prepared,
+            status_code=resp.status_code,
+            latency_ms=elapsed,
+            check_id="baseline",
+            safety_level=SafetyLevel.PASSIVE.value,
+            outcome=RequestLedger.OUTCOME_SUCCEEDED,
+        )
+    except requests.exceptions.Timeout:
+        out["error"] = "timeout"
+        _ledger(
+            scan,
+            prepared=prepared,
+            status_code=0,
+            error="timeout",
+            check_id="baseline",
+            safety_level=SafetyLevel.PASSIVE.value,
+            outcome=RequestLedger.OUTCOME_FAILED,
+        )
     except requests.exceptions.RequestException as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
+        _ledger(
+            scan,
+            prepared=prepared,
+            status_code=0,
+            error=str(exc),
+            check_id="baseline",
+            safety_level=SafetyLevel.PASSIVE.value,
+            outcome=RequestLedger.OUTCOME_FAILED,
+        )
     except Exception as exc:  # pragma: no cover - defensive
         out["error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
-def _benign_request(endpoint: Endpoint, cfg: ScanConfig):
+def _endpoint_template(endpoint: Endpoint, cfg: ScanConfig) -> RequestTemplate:
+    """Build a RequestTemplate mirroring the legacy benign request for an endpoint."""
     path_params = {p.name: _placeholder_value(p) for p in endpoint.parameters if p.location == "path"}
-    url = cfg.base_url.rstrip("/") + _build_path(endpoint.path, path_params)
-    headers: Dict[str, str] = {}
-    if cfg.auth_header:
-        if cfg.auth_header.lower().startswith("authorization:"):
-            _, _, val = cfg.auth_header.partition(":")
-            headers["Authorization"] = val.strip()
-        else:
-            headers["Authorization"] = cfg.auth_header
-    for p in endpoint.parameters:
-        if p.location == "header":
-            headers[p.name] = str(_placeholder_value(p))
-    params = {p.name: _placeholder_value(p) for p in endpoint.parameters if p.location == "query"}
+    query_params = {p.name: _placeholder_value(p) for p in endpoint.parameters if p.location == "query"}
+    header_params = {p.name: _placeholder_value(p) for p in endpoint.parameters if p.location == "header"}
+    cookie_params = {p.name: _placeholder_value(p) for p in endpoint.parameters if p.location == "cookie"}
+    media_type = "application/json" if endpoint.consumes_json else "application/x-www-form-urlencoded"
     body = copy.deepcopy(endpoint.body_example) if endpoint.has_body else None
-    return url, headers, params, body
+    return RequestTemplate(
+        method=endpoint.method,
+        path=endpoint.path,
+        base_url=cfg.base_url,
+        path_params=path_params,
+        query_params=query_params,
+        header_params=header_params,
+        cookie_params=cookie_params,
+        body=body,
+        media_type=media_type if endpoint.has_body else "",
+        has_body=endpoint.has_body,
+        auth_profile=AuthProfile.from_header("default", cfg.auth_header),
+    )
+
+
+def _benign_request(endpoint: Endpoint, cfg: ScanConfig):
+    """Return (url, headers, query_params, body) for a benign request.
+
+    Backward-compatible tuple form; construction is routed through
+    request_builder so the prepared representation is canonical.
+    """
+    template = _endpoint_template(endpoint, cfg)
+    prepared = build_request(template)
+    return prepared.url, dict(prepared.headers), dict(prepared.query_params), template.body
 
 
 def _inject(value: Any, payload: str) -> str:
@@ -207,29 +294,30 @@ def _walk_body_targets(body: Any, prefix: str = ""):
                 yield (new_prefix, body, i)
 
 
-def _send(
+def _send_prepared(
     session: requests.Session,
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    params: Dict[str, Any],
-    body: Any,
-    consumes_json: bool,
+    prepared: PreparedRequest,
     has_body: bool,
     timeout: float,
 ):
+    """Send a PreparedRequest; returns (status, headers, text, elapsed_ms, error).
+
+    The serialized body and Content-Type are carried on ``prepared``; query
+    params are passed via ``params=`` so the existing FakeSession test harness
+    (which inspects ``kwargs['params']``) keeps working. The exact encoded URL
+    is recorded separately on ``prepared.encoded_url``.
+    """
     t0 = time.perf_counter()
     try:
-        resp = session.request(
-            method=method,
-            url=url,
-            headers=headers,
-            params=params,
-            json=body if has_body and consumes_json else None,
-            data=body if has_body and not consumes_json else None,
-            timeout=timeout,
-            allow_redirects=False,
-        )
+        kwargs: Dict[str, Any] = {
+            "headers": prepared.headers,
+            "params": prepared.query_params or None,
+            "timeout": timeout,
+            "allow_redirects": False,
+        }
+        if has_body and prepared.body is not None:
+            kwargs["data"] = prepared.body
+        resp = session.request(prepared.method, prepared.url, **kwargs)
         elapsed = int((time.perf_counter() - t0) * 1000)
         text = resp.text or ""
         return resp.status_code, dict(resp.headers), text, elapsed, None
@@ -239,6 +327,34 @@ def _send(
     except requests.exceptions.RequestException as exc:
         elapsed = int((time.perf_counter() - t0) * 1000)
         return 0, {}, "", elapsed, str(exc)
+
+
+def _ledger(
+    scan: Optional[ScanState],
+    *,
+    prepared: Optional[PreparedRequest],
+    status_code: int = 0,
+    latency_ms: Optional[int] = None,
+    error: Optional[str] = None,
+    check_id: str = "",
+    safety_level: str = SafetyLevel.SAFE_ACTIVE.value,
+    outcome: str = RequestLedger.OUTCOME_SUCCEEDED,
+) -> None:
+    """Append a request ledger entry for an outbound request (no-op if no scan)."""
+    if scan is None:
+        return
+    method = prepared.method if prepared is not None else ""
+    url = prepared.encoded_url if prepared is not None else ""
+    return scan.ledger.record(
+        method=method,
+        url=url,
+        check_id=check_id,
+        safety_level=safety_level,
+        status_code=status_code,
+        latency_ms=latency_ms,
+        error=error,
+        outcome=outcome,
+    )
 
 
 def _record(scan: ScanState, *finds: Finding):
@@ -334,18 +450,21 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
     session = UASession(cfg.user_agent_mode, cfg.user_agent_custom)
     selected = payloads_for(cfg.categories)
     total_requests = estimate_total_requests(endpoints, cfg.categories)
+    scan_mode = normalize_scan_mode(cfg.scan_mode)
 
     with scan._lock:
         scan.status = "running"
         scan.started_at = time.time()
         scan.total_requests = total_requests
+        scan.planned_requests = total_requests
         scan.endpoint_count = len(endpoints)
         scan.base_url = cfg.base_url
         scan.categories = list(cfg.categories)
         scan.detect_misconfig = cfg.detect_misconfig
+        scan.scan_mode = scan_mode
 
     # --- Preflight + global misconfiguration probes ----------------------
-    if cfg.detect_misconfig:
+    if cfg.detect_misconfig and safety_allowed(SafetyLevel.PASSIVE.value, scan_mode):
         try:
             pf_findings, pf_warnings = misconfig.preflight(
                 cfg.base_url, session, cfg.timeout, cfg.auth_header
@@ -361,7 +480,7 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
             _add_warning(scan, f"Misconfig preflight failed: {type(exc).__name__}: {exc}")
 
     # --- Rate-limit probe (once per scan) ---------------------------------
-    if cfg.rate_limit_probe:
+    if cfg.rate_limit_probe and safety_allowed(SafetyLevel.SAFE_ACTIVE.value, scan_mode):
         try:
             probe_path = endpoints[0].path if endpoints else "/"
             rl_findings = misconfig.probe_rate_limit(
@@ -372,7 +491,7 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
             _add_warning(scan, f"Rate-limit probe failed: {type(exc).__name__}: {exc}")
 
     # --- API version inventory (once per scan) ----------------------------
-    if cfg.api_version_inventory:
+    if cfg.api_version_inventory and safety_allowed(SafetyLevel.PASSIVE.value, scan_mode):
         try:
             av_findings = misconfig.probe_api_versions(
                 cfg.base_url,
@@ -393,12 +512,22 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
     reached_count = 0
     try:
         for ep in endpoints:
+            if scan.cancel_event.is_set():
+                _add_warning(scan, "Scan cancelled by user.")
+                with scan._lock:
+                    scan.cancelled = True
+                    scan.status = "completed"
+                    scan.finished_at = time.time()
+                    scan.findings = misconfig.dedupe(sort_findings(scan.findings))
+                return
+
             ep_label = f"{ep.method} {ep.path}"
             targets = _injection_targets(ep)
-            if not targets:
-                continue
 
-            baseline = _baseline_request(session, ep, cfg)
+            # Phase 0: always run a baseline and passive/observational checks
+            # for every endpoint -- do not skip just because there is no
+            # injectable parameter. Only the payload loop is skipped below.
+            baseline = _baseline_request(session, ep, cfg, scan)
             if baseline["error"]:
                 _record_failure(scan, f"baseline {ep_label}: {baseline['error']}")
             else:
@@ -430,7 +559,12 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                             used_auth=True,
                         ))
                 # JWT attacks: run once against the first reachable endpoint.
-                if cfg.jwt_attacks and not jwt_done and 200 <= baseline["status_code"] < 300:
+                if (
+                    cfg.jwt_attacks
+                    and not jwt_done
+                    and 200 <= baseline["status_code"] < 300
+                    and safety_allowed(SafetyLevel.SAFE_ACTIVE.value, scan_mode)
+                ):
                     try:
                         jwt_findings = jwt_checks.run_jwt_attacks(
                             auth_header=cfg.auth_header,
@@ -445,9 +579,14 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                     except Exception as exc:  # pragma: no cover - defensive
                         _add_warning(scan, f"JWT attacks failed: {type(exc).__name__}: {exc}")
                     jwt_done = True
-            if cfg.detect_misconfig:
+
+            # Phase 0: substitute path parameters before every specialized probe.
+            path_params = {p.name: _placeholder_value(p) for p in ep.parameters if p.location == "path"}
+            resolved_path = _build_path(ep.path, path_params)
+
+            if cfg.detect_misconfig and safety_allowed(SafetyLevel.PASSIVE.value, scan_mode):
                 method_findings = misconfig.enumerate_methods(
-                    cfg.base_url, ep.path, session, cfg.timeout, cfg.auth_header
+                    cfg.base_url, resolved_path, session, cfg.timeout, cfg.auth_header
                 )
                 _record(scan, *method_findings)
 
@@ -455,54 +594,65 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
 
             # --- Extended request-mutation checks (once per endpoint) -----
             benign_query = {p.name: _placeholder_value(p) for p in ep.parameters if p.location == "query"}
-            try:
-                if cfg.extra_mass_assignment and ep.has_body and isinstance(ep.body_example, dict):
-                    _record(scan, *extra_checks.mass_assignment_probe(
-                        base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                        body_example=ep.body_example, baseline_status=baseline["status_code"],
-                        session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
-                    ))
-                if cfg.extra_hpp and benign_query:
-                    _record(scan, *extra_checks.http_parameter_pollution_probe(
-                        base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                        benign_query=benign_query,
-                        session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
-                    ))
-                if cfg.extra_method_override:
-                    _record(scan, *extra_checks.method_override_probe(
-                        base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                        session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
-                    ))
-                if cfg.extra_content_type_confusion:
-                    _record(scan, *extra_checks.content_type_confusion_probe(
-                        base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                        body_example=ep.body_example, consumes_json=ep.consumes_json,
-                        session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
-                    ))
-                if cfg.extra_open_redirect:
-                    for p in ep.parameters:
-                        _record(scan, *extra_checks.open_redirect_focused_probe(
-                            base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                            parameter_name=p.name, parameter_location=p.location,
+            if safety_allowed(SafetyLevel.SAFE_ACTIVE.value, scan_mode):
+                try:
+                    if cfg.extra_mass_assignment and ep.has_body and isinstance(ep.body_example, dict):
+                        _record(scan, *extra_checks.mass_assignment_probe(
+                            base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
+                            body_example=ep.body_example, baseline_status=baseline["status_code"],
+                            session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
+                        ))
+                    if cfg.extra_hpp and benign_query:
+                        _record(scan, *extra_checks.http_parameter_pollution_probe(
+                            base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
                             benign_query=benign_query,
                             session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
                         ))
-                if cfg.extra_canary_reflection:
-                    for p in ep.parameters:
-                        _record(scan, *extra_checks.canary_reflection_probe(
-                            base_url=cfg.base_url, endpoint_path=ep.path, method=ep.method,
-                            parameter_name=p.name, parameter_location=p.location,
-                            benign_query=benign_query, benign_body=ep.body_example,
-                            consumes_json=ep.consumes_json,
+                    if cfg.extra_method_override:
+                        _record(scan, *extra_checks.method_override_probe(
+                            base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
                             session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
                         ))
-                if cfg.schema_violations:
-                    _record(scan, *schema_checks.run_schema_checks(
-                        endpoint=ep, base_url=cfg.base_url,
-                        session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
-                    ))
-            except Exception as exc:  # pragma: no cover - defensive
-                _add_warning(scan, f"Extended checks failed for {ep_label}: {type(exc).__name__}: {exc}")
+                    if cfg.extra_content_type_confusion:
+                        _record(scan, *extra_checks.content_type_confusion_probe(
+                            base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
+                            body_example=ep.body_example, consumes_json=ep.consumes_json,
+                            session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
+                        ))
+                    if cfg.extra_open_redirect:
+                        for p in ep.parameters:
+                            _record(scan, *extra_checks.open_redirect_focused_probe(
+                                base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
+                                parameter_name=p.name, parameter_location=p.location,
+                                benign_query=benign_query,
+                                session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
+                            ))
+                    if cfg.extra_canary_reflection:
+                        for p in ep.parameters:
+                            _record(scan, *extra_checks.canary_reflection_probe(
+                                base_url=cfg.base_url, endpoint_path=resolved_path, method=ep.method,
+                                parameter_name=p.name, parameter_location=p.location,
+                                benign_query=benign_query, benign_body=ep.body_example,
+                                consumes_json=ep.consumes_json,
+                                session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
+                            ))
+                    if cfg.schema_violations:
+                        _record(scan, *schema_checks.run_schema_checks(
+                            endpoint=ep, base_url=cfg.base_url,
+                            session=session, timeout=cfg.timeout, auth_header=cfg.auth_header,
+                        ))
+                except Exception as exc:  # pragma: no cover - defensive
+                    _add_warning(scan, f"Extended checks failed for {ep_label}: {type(exc).__name__}: {exc}")
+
+            # --- Payload injection loop (only for endpoints with targets) --
+            if not targets:
+                with scan._lock:
+                    scan.skipped_requests += 1
+                continue
+
+            # Passive mode observes only; skip active payload injection.
+            if not safety_allowed(SafetyLevel.SAFE_ACTIVE.value, scan_mode):
+                continue
 
             for target in targets:
                 for category, items in selected.items():
@@ -510,6 +660,14 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                     if category == "type_juggling":
                         items = payloads_for_type(target.get("schema_type", "string"))
                     for raw_payload, technique in items:
+                        if scan.cancel_event.is_set():
+                            _add_warning(scan, "Scan cancelled by user.")
+                            with scan._lock:
+                                scan.cancelled = True
+                                scan.status = "completed"
+                                scan.finished_at = time.time()
+                                scan.findings = misconfig.dedupe(sort_findings(scan.findings))
+                            return
                         # v1.10: apply WAF-evasion obfuscation before sending.
                         # The transformed value is what hits the wire AND what
                         # we record on the Finding's `payload` field, so the
@@ -518,6 +676,8 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                             raw_payload, category, cfg.payload_obfuscation
                         )
                         if cfg.max_requests > 0 and sent >= cfg.max_requests:
+                            with scan._lock:
+                                scan.budget_exhausted = max(0, total_requests - sent)
                             _add_warning(
                                 scan,
                                 f"Request budget ({cfg.max_requests}) reached; remaining payloads skipped.",
@@ -530,53 +690,47 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                             return
                         sent += 1
 
-                        url, headers, params, body = _benign_request(ep, cfg)
-                        request_body_str: Optional[str] = None
-
+                        # Phase 0: build the request through request_builder so
+                        # the exact encoded URL, headers, and serialized body
+                        # are recorded on the finding and in the ledger.
+                        template = _endpoint_template(ep, cfg)
                         if target["location"] == "query":
-                            params[target["name"]] = _inject(params.get(target["name"]), payload)
-                        elif target["location"] == "path":
-                            path_params = {
-                                p.name: _placeholder_value(p)
-                                for p in ep.parameters
-                                if p.location == "path"
-                            }
-                            path_params[target["name"]] = payload
-                            url = cfg.base_url.rstrip("/") + _build_path(ep.path, path_params)
-                        elif target["location"] == "header":
-                            headers[target["name"]] = payload
-                        elif target["location"] == "body":
-                            body_copy = copy.deepcopy(body) if isinstance(body, (dict, list)) else body
-                            if target["kind"] == "body" and isinstance(body_copy, dict):
-                                _set_body_leaf(body_copy, target["name"], payload)
-                                body = body_copy
-                            elif target["kind"] == "raw_body":
-                                body = payload
-                            request_body_str = (
-                                jsonlib.dumps(body)
-                                if isinstance(body, (dict, list))
-                                else (body if isinstance(body, str) else None)
+                            template.query_params[target["name"]] = _inject(
+                                template.query_params.get(target["name"]), payload
                             )
+                        elif target["location"] == "path":
+                            template.path_params[target["name"]] = payload
+                        elif target["location"] == "header":
+                            template.header_params[target["name"]] = payload
+                        elif target["location"] == "body":
+                            if target["kind"] == "body" and isinstance(template.body, dict):
+                                body_copy = copy.deepcopy(template.body)
+                                _set_body_leaf(body_copy, target["name"], payload)
+                                template.body = body_copy
+                            elif target["kind"] == "raw_body":
+                                template.body = payload
+                        prepared = build_request(template)
 
-                        status, _resp_headers, text, elapsed, err = _send(
-                            session,
-                            ep.method,
-                            url,
-                            headers,
-                            params,
-                            body,
-                            ep.consumes_json,
-                            ep.has_body,
-                            cfg.timeout,
+                        status, _resp_headers, text, elapsed, err = _send_prepared(
+                            session, prepared, ep.has_body, cfg.timeout
                         )
 
                         if err and err != "timeout":
                             _record_failure(scan, f"{ep_label}: {err}")
+                            _ledger(
+                                scan, prepared=prepared, status_code=0, latency_ms=elapsed,
+                                error=err, check_id=category,
+                                safety_level=SafetyLevel.SAFE_ACTIVE.value,
+                                outcome=RequestLedger.OUTCOME_FAILED,
+                            )
+                        elif err == "timeout":
+                            _ledger(
+                                scan, prepared=prepared, status_code=0, latency_ms=elapsed,
+                                error="timeout", check_id=category,
+                                safety_level=SafetyLevel.SAFE_ACTIVE.value,
+                                outcome=RequestLedger.OUTCOME_FAILED,
+                            )
                         else:
-                            # v1.7: bake any query-string params into the URL
-                            # we record so the Finding's raw_request blob
-                            # shows the payload-bearing query parameter.
-                            recorded_url = url_with_query(url, params)
                             findings = analyze(
                                 category=category,
                                 payload=payload,
@@ -585,16 +739,29 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                                 method=ep.method,
                                 parameter=target["name"],
                                 location=target["location"],
-                                request_url=recorded_url,
-                                request_headers=headers,
-                                request_body=request_body_str,
+                                request_url=prepared.encoded_url,
+                                request_headers=prepared.headers,
+                                request_body=prepared.body,
                                 status_code=status,
                                 response_text=text,
                                 response_time_ms=elapsed,
                                 baseline_time_ms=baseline_ms,
                                 response_headers=_resp_headers,
+                                check_id=category,
+                                safety_level=SafetyLevel.SAFE_ACTIVE.value,
+                                auth_profile="default" if cfg.auth_header else "anonymous",
                             )
                             _record(scan, *findings)
+                            entry = _ledger(
+                                scan, prepared=prepared, status_code=status, latency_ms=elapsed,
+                                check_id=category, safety_level=SafetyLevel.SAFE_ACTIVE.value,
+                                outcome=RequestLedger.OUTCOME_SUCCEEDED,
+                            )
+                            # Link each emitted finding to its ledger entry so
+                            # every finding references a reproducible request.
+                            if entry is not None:
+                                for _f in findings:
+                                    _f.ledger_index = entry.index
 
                         _bump(scan, ep_label)
 
