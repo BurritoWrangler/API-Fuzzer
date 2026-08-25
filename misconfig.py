@@ -61,7 +61,6 @@ DISCLOSURE_HEADERS = [
 COMMON_PATHS: List[Tuple[str, str]] = [
     ("/.git/config", "Git config exposed"),
     ("/.env", "Environment file exposed"),
-    ("/.well-known/security.txt", "security.txt advertised"),
     ("/swagger.json", "Swagger spec exposed"),
     ("/openapi.json", "OpenAPI spec exposed"),
     ("/api-docs", "API documentation exposed"),
@@ -361,16 +360,27 @@ def inspect_response(
     response_text: str,
     is_https: bool,
     response_time_ms: int,
+    # FP fix: auth context for CORS wildcard suppression on public endpoints.
+    used_auth: bool = False,
 ) -> List[Finding]:
     """Return Findings for missing/weak headers, cookies, server disclosure."""
     findings: List[Finding] = []
     lower_headers = {k.lower(): v for k, v in response_headers.items()}
+
+    # FP fix: determine response content type to suppress browser-only
+    # security header findings on JSON/API responses.
+    content_type = lower_headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    is_html_response = content_type in ("text/html", "application/xhtml+xml", "")
 
     # Security headers
     for header_name, severity, message in REQUIRED_HEADERS:
         if header_name.lower() not in lower_headers:
             # HSTS only matters if the response is over HTTPS.
             if header_name == "Strict-Transport-Security" and not is_https:
+                continue
+            # FP fix: CSP and X-Frame-Options are browser-level protections
+            # for HTML responses. API endpoints returning JSON don't need them.
+            if header_name in ("Content-Security-Policy", "X-Frame-Options") and not is_html_response:
                 continue
             findings.append(
                 _mk(
@@ -402,18 +412,21 @@ def inspect_response(
             )
         )
     elif acao == "*":
-        findings.append(
-            _mk(
-                "low",
-                "CORS: wildcard Access-Control-Allow-Origin",
-                endpoint=endpoint,
-                method=method,
-                request_url=request_url,
-                evidence="ACAO of '*' may be intentional for public APIs; review whether it should be tighter.",
-                status_code=status_code,
-                request_headers=response_headers,
+        # FP fix: don't flag ACAO:* on public/unauthenticated endpoints.
+        # If no auth was used and the endpoint is public, * is intentional.
+        if used_auth:
+            findings.append(
+                _mk(
+                    "low",
+                    "CORS: wildcard Access-Control-Allow-Origin",
+                    endpoint=endpoint,
+                    method=method,
+                    request_url=request_url,
+                    evidence="ACAO of '*' may be intentional for public APIs; review whether it should be tighter.",
+                    status_code=status_code,
+                    request_headers=response_headers,
+                )
             )
-        )
 
     # Cookie flags
     for raw_cookie in set_cookies:
@@ -490,12 +503,15 @@ def probe_rate_limit(
     session: requests.Session,
     timeout: float,
     auth_header: Optional[str],
-    burst: int = 20,
+    burst: int = 50,
 ) -> List[Finding]:
     """Fire `burst` quick GETs and look for rate-limit signals.
 
     If none of the responses ever expose `Retry-After` or any `RateLimit-*`
-    header and no 429 is returned, emit a *medium* informational finding.
+    header and no 429 is returned, emit a *low* informational finding.
+
+    FP fix: raised burst from 20 to 50 and lowered severity from medium to low
+    — most rate limiters have thresholds far above 20.
     """
     findings: List[Finding] = []
     headers = _auth_headers(auth_header)
@@ -515,7 +531,7 @@ def probe_rate_limit(
     if not seen_signal:
         findings.append(
             _mk(
-                "medium",
+                "low",
                 "No rate-limiting signal observed",
                 endpoint=probe_path,
                 method="GET",
@@ -555,15 +571,18 @@ def check_auth_cache_control(
             )
         ]
     if "no-store" not in cc and ("public" in cc or "max-age" in cc):
-        return [
-            _mk(
-                "medium",
-                "Authenticated response cacheable in shared caches",
-                endpoint=endpoint, method=method, request_url=request_url,
-                evidence=f"Authenticated 2xx response uses Cache-Control: {cc!r} (lacks 'no-store').",
-                status_code=status_code, request_headers=response_headers,
-            )
-        ]
+        # FP fix: accept 'private' as well as 'no-store' — both prevent
+        # shared-cache storage of authenticated responses.
+        if "private" not in cc:
+            return [
+                _mk(
+                    "medium",
+                    "Authenticated response cacheable in shared caches",
+                    endpoint=endpoint, method=method, request_url=request_url,
+                    evidence=f"Authenticated 2xx response uses Cache-Control: {cc!r} (lacks 'no-store' or 'private').",
+                    status_code=status_code, request_headers=response_headers,
+                )
+            ]
     return []
 
 

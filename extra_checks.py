@@ -466,7 +466,11 @@ def canary_reflection_probe(
     text = resp.text or ""
     resp_hdrs = dict(resp.headers)
     recorded_url = url_with_query(url, params)
-    if canary in text:
+    # FP fix: only flag canary reflection in executable (HTML) contexts.
+    # JSON responses that echo a search query are normal API behavior, not XSS.
+    resp_content_type = resp_hdrs.get("Content-Type", "").lower()
+    is_executable_context = "html" in resp_content_type or resp_content_type == "" or resp_content_type.startswith("text/")
+    if canary in text and is_executable_context:
         findings.append(
             _mk(
                 "low",
