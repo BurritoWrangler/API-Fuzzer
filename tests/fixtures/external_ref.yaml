@@ -1,0 +1,28 @@
+openapi: 3.0.3
+info:
+  title: External ref fixture
+  version: "1.0"
+components:
+  schemas:
+    Thing:
+      type: object
+      properties:
+        external:
+          $ref: "./other.yaml#/components/schemas/Other"
+        remote:
+          $ref: "https://example.com/specs/petstore.yaml#/Pet"
+        local:
+          $ref: "#/components/schemas/Thing"
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Thing"
+      responses:
+        "200":
+          description: ok

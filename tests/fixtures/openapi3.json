@@ -1,0 +1,131 @@
+{
+  "openapi": "3.0.3",
+  "info": {"title": "OpenAPI 3 fixture", "version": "1.0"},
+  "servers": [
+    {"url": "https://api.example.com/v1", "description": "prod"},
+    {"url": "https://{env}.api.example.com", "variables": {"env": {"default": "staging"}}}
+  ],
+  "security": [
+    {"bearer_auth": []}
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearer_auth": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
+      "api_key": {"type": "apiKey", "in": "header", "name": "X-API-Key"},
+      "oauth": {"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "https://example.com/token", "scopes": {"read": "read access"}}}}
+    },
+    "schemas": {
+      "Pet": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "id": {"type": "integer", "format": "int64", "readOnly": true},
+          "name": {"type": "string", "example": "rex"},
+          "species": {"type": "string", "enum": ["dog", "cat"]},
+          "born_at": {"type": "string", "format": "date-time"},
+          "owner": {"$ref": "#/components/schemas/Owner"}
+        }
+      },
+      "Owner": {
+        "type": "object",
+        "required": ["email"],
+        "properties": {
+          "email": {"type": "string", "format": "email"},
+          "uuid": {"type": "string", "format": "uuid"},
+          "role": {"type": "string", "default": "member", "writeOnly": true}
+        }
+      },
+      "PetWithMeta": {
+        "allOf": [
+          {"$ref": "#/components/schemas/Pet"},
+          {"type": "object", "properties": {"tag": {"type": "string"}}}
+        ]
+      },
+      "Animal": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/Pet"},
+          {"type": "object", "title": "Cat", "properties": {"lives": {"type": "integer"}}}
+        ],
+        "discriminator": {"propertyName": "species"}
+      },
+      "SearchResult": {
+        "type": "object",
+        "properties": {
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/Pet"}},
+          "count": {"type": "integer"}
+        }
+      }
+    },
+    "parameters": {
+      "LimitParam": {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 0, "maximum": 100}}
+    }
+  },
+  "paths": {
+    "/pets/{pet_id}": {
+      "parameters": [
+        {"name": "pet_id", "in": "path", "required": true, "schema": {"type": "integer"}},
+        {"name": "limit", "in": "query", "schema": {"type": "integer"}}
+      ],
+      "get": {
+        "operationId": "getPet",
+        "parameters": [
+          {"name": "limit", "in": "query", "schema": {"type": "integer", "maximum": 50}}
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Pet"}}}
+          },
+          "404": {"description": "not found"}
+        }
+      },
+      "post": {
+        "operationId": "updatePet",
+        "parameters": [
+          {"name": "X-Trace", "in": "header", "required": true, "schema": {"type": "string"}},
+          {"name": "session", "in": "cookie", "required": true, "schema": {"type": "string"}}
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/Pet"}},
+            "application/x-www-form-urlencoded": {"schema": {"$ref": "#/components/schemas/Pet"}},
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {"type": "string"},
+                  "avatar": {"type": "string", "format": "binary"}
+                }
+              }
+            },
+            "application/xml": {
+              "schema": {
+                "type": "object",
+                "xml": {"name": "pet"},
+                "properties": {"name": {"type": "string"}, "species": {"type": "string"}}
+              }
+            }
+          }
+        },
+        "responses": {"200": {"description": "ok"}},
+        "security": [{"api_key": []}]
+      }
+    },
+    "/search": {
+      "get": {
+        "operationId": "search",
+        "parameters": [
+          {"$ref": "#/components/parameters/LimitParam"}
+        ],
+        "servers": [{"url": "https://search.example.com"}],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SearchResult"}}}
+          }
+        }
+      }
+    }
+  }
+}

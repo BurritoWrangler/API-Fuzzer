@@ -1,0 +1,46 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "OpenAPI 3.1 fixture", "version": "1.0"},
+  "components": {
+    "schemas": {
+      "Account": {
+        "type": "object",
+        "properties": {
+          "id": {"type": ["string", "null"]},
+          "kind": {"const": "account"},
+          "balance": {"type": ["number", "null"], "format": "double"},
+          "currency": {"type": ["string", "null"], "enum": ["USD", "EUR", null]},
+          "label": {"type": ["string", "null"], "default": "primary"}
+        }
+      },
+      "NullableList": {
+        "type": ["array", "null"],
+        "items": {"type": ["string", "null"]}
+      }
+    }
+  },
+  "paths": {
+    "/accounts/{id}": {
+      "parameters": [
+        {"name": "id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+      ],
+      "get": {
+        "operationId": "getAccount",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Account"}}}
+          }
+        }
+      },
+      "put": {
+        "operationId": "updateAccount",
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Account"}}}
+        },
+        "responses": {"200": {"description": "ok"}}
+      }
+    }
+  }
+}

@@ -412,6 +412,157 @@ def open_redirect_focused_probe(
 
 
 # ---------------------------------------------------------------------------
+# WebDAV method abuse (intrusive: writes a canary file)
+# ---------------------------------------------------------------------------
+
+WEBDAV_METHODS = ("PUT", "PROPFIND", "SEARCH")
+
+
+def webdav_put_probe(
+    *,
+    base_url: str,
+    endpoint_path: str,
+    session: requests.Session,
+    timeout: float,
+    auth_header: Optional[str],
+    confirmed_intrusive: bool = False,
+) -> List[Finding]:
+    """Probe WebDAV-style arbitrary write with a harmless canary.
+
+    PUTs a canary to the endpoint path; a 2xx write followed by a GET serving
+    the canary back is confirmed arbitrary file write. GET-only verification
+    (2xx PUT without readback) is a strong signal. Requires explicit
+    intrusive confirmation — this creates state on the target.
+    """
+    findings: List[Finding] = []
+    if not confirmed_intrusive:
+        return findings
+    url = base_url.rstrip("/") + endpoint_path
+    headers = _auth_headers(auth_header)
+    canary = f"apifz-webdav-{secrets.token_hex(4)}"
+
+    try:
+        put_resp = session.request(
+            "PUT", url + "/apifz-canary.txt",
+            headers={**headers, "Content-Type": "text/plain"},
+            data=canary, timeout=timeout, allow_redirects=False,
+        )
+    except requests.exceptions.RequestException:
+        return findings
+
+    if not (200 <= put_resp.status_code < 300):
+        return findings
+
+    # Readback to confirm the write is served.
+    try:
+        get_resp = session.request(
+            "GET", url + "/apifz-canary.txt",
+            headers=headers, timeout=timeout, allow_redirects=False,
+        )
+    except requests.exceptions.RequestException:
+        get_resp = None
+
+    served = get_resp is not None and canary in (get_resp.text or "")
+    findings.append(
+        _mk(
+            "critical" if served else "high",
+            "WebDAV PUT write confirmed" if served else "WebDAV PUT accepted without readback",
+            "webdav_abuse",
+            endpoint=endpoint_path,
+            method="PUT",
+            request_url=url + "/apifz-canary.txt",
+            evidence=(
+                f"PUT succeeded (HTTP {put_resp.status_code})"
+                + (f" and GET served the canary back (HTTP {get_resp.status_code})."
+                   if served and get_resp is not None
+                   else "; the content was not served back — verify write location.")
+            ),
+            payload=canary,
+            parameter="<path>",
+            location="path",
+            status_code=put_resp.status_code,
+            request_headers=headers,
+            response_body=(get_resp.text or "") if get_resp is not None else "",
+            response_headers=dict(get_resp.headers) if get_resp is not None else {},
+        )
+    )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Content negotiation (Accept-header) probing
+# ---------------------------------------------------------------------------
+
+
+def content_negotiation_probe(
+    *,
+    base_url: str,
+    endpoint_path: str,
+    method: str,
+    session: requests.Session,
+    timeout: float,
+    auth_header: Optional[str],
+    declared_types: Optional[set] = None,
+) -> List[Finding]:
+    """Probe whether Accept/format negotiation returns undeclared formats.
+
+    Some frameworks expose richer (or leaking) representations via content
+    negotiation even when the spec only documents JSON. Flag when a format
+    outside the declared set is returned with a 2xx.
+    """
+    findings: List[Finding] = []
+    url = base_url.rstrip("/") + endpoint_path
+    headers = _auth_headers(auth_header)
+    negotiation = [
+        ("Accept", "application/xml"),
+        ("Accept", "text/html"),
+        ("Accept", "application/yaml"),
+    ]
+    for accept_value in negotiation:
+        try:
+            resp = session.request(
+                method, url,
+                headers={**headers, accept_value[0]: accept_value[1]},
+                timeout=timeout, allow_redirects=False,
+            )
+        except requests.exceptions.RequestException:
+            continue
+        if not (200 <= resp.status_code < 300):
+            continue
+        content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if not content_type:
+            continue
+        requested = accept_value[1].split("/")[1]
+        if requested not in content_type:
+            continue
+        if declared_types and content_type in declared_types:
+            continue  # declared format: no finding
+        findings.append(
+            _mk(
+                "low",
+                f"Undocumented content negotiation: {content_type} returned",
+                "content_negotiation",
+                endpoint=endpoint_path,
+                method=method,
+                request_url=url,
+                evidence=(
+                    f"Accept: {accept_value[1]} produced Content-Type {content_type} "
+                    f"(HTTP {resp.status_code}). If not declared in the spec, this "
+                    f"representation may bypass JSON-oriented access controls."
+                ),
+                parameter="Accept",
+                location="header",
+                status_code=resp.status_code,
+                request_headers={**headers, accept_value[0]: accept_value[1]},
+                response_body=resp.text or "",
+                response_headers=dict(resp.headers),
+            )
+        )
+        break  # one undeclared format is enough signal
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Canary reflection map
 # ---------------------------------------------------------------------------
 
@@ -466,7 +617,11 @@ def canary_reflection_probe(
     text = resp.text or ""
     resp_hdrs = dict(resp.headers)
     recorded_url = url_with_query(url, params)
-    if canary in text:
+    # FP fix: only flag canary reflection in executable (HTML) contexts.
+    # JSON responses that echo a search query are normal API behavior, not XSS.
+    resp_content_type = resp_hdrs.get("Content-Type", "").lower()
+    is_executable_context = "html" in resp_content_type or resp_content_type == "" or resp_content_type.startswith("text/")
+    if canary in text and is_executable_context:
         findings.append(
             _mk(
                 "low",

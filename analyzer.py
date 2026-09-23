@@ -7,9 +7,52 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlencode
 
+from models import Confidence, SafetyLevel
+from redaction import (
+    DEFAULT_REDACTION_CONFIG,
+    RedactionConfig,
+    redact_body_text,
+    redact_headers,
+    redact_url_query,
+)
+
 
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
 SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
+
+# Phase 0: per-category OWASP API / CWE / safety metadata and a default
+# confidence mapping. Confidence is intentionally separate from severity
+# (impact); heuristic detections override the default with a lower confidence.
+CATEGORY_META: Dict[str, Dict[str, str]] = {
+    "sql_injection": {"owasp_api": "API3:2023", "cwe": "CWE-89", "safety": "safe_active"},
+    "nosql_injection": {"owasp_api": "API3:2023", "cwe": "CWE-943", "safety": "safe_active"},
+    "command_injection": {"owasp_api": "API3:2023", "cwe": "CWE-78", "safety": "safe_active"},
+    "xss": {"owasp_api": "API3:2023", "cwe": "CWE-79", "safety": "safe_active"},
+    "path_traversal": {"owasp_api": "API3:2023", "cwe": "CWE-22", "safety": "safe_active"},
+    "ssrf": {"owasp_api": "API4:2023", "cwe": "CWE-918", "safety": "safe_active"},
+    "header_injection": {"owasp_api": "API3:2023", "cwe": "CWE-93", "safety": "safe_active"},
+    "auth_bypass": {"owasp_api": "API1:2023", "cwe": "CWE-287", "safety": "safe_active"},
+    "info_disclosure": {"owasp_api": "API3:2023", "cwe": "CWE-209", "safety": "passive"},
+    "ssti": {"owasp_api": "API3:2023", "cwe": "CWE-94", "safety": "safe_active"},
+    "ldap_injection": {"owasp_api": "API3:2023", "cwe": "CWE-90", "safety": "safe_active"},
+    "xpath_injection": {"owasp_api": "API3:2023", "cwe": "CWE-643", "safety": "safe_active"},
+    "prototype_pollution": {"owasp_api": "API3:2023", "cwe": "CWE-1321", "safety": "safe_active"},
+    "open_redirect": {"owasp_api": "API3:2023", "cwe": "CWE-601", "safety": "safe_active"},
+    "ssi_injection": {"owasp_api": "API3:2023", "cwe": "CWE-97", "safety": "safe_active"},
+    "type_juggling": {"owasp_api": "API3:2023", "cwe": "CWE-843", "safety": "safe_active"},
+}
+
+_SEVERITY_CONFIDENCE: Dict[str, str] = {
+    "critical": Confidence.HIGH.value,
+    "high": Confidence.HIGH.value,
+    "medium": Confidence.MEDIUM.value,
+    "low": Confidence.LOW.value,
+    "info": Confidence.INFORMATIONAL.value,
+}
+
+
+def _severity_to_confidence(severity: str) -> str:
+    return _SEVERITY_CONFIDENCE.get(severity, Confidence.INFORMATIONAL.value)
 
 
 # Hard cap on the captured response body to keep scan memory bounded. Larger
@@ -17,10 +60,13 @@ SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITY_ORDER)}
 # with an explicit marker so the user knows.
 MAX_BODY_BYTES = 1_048_576  # 1 MiB
 
-# Default User-Agent used by `format_raw_http_request` when the supplied
-# request_headers dict has no User-Agent of its own. `UASession.__init__`
-# overrides this at scan start so the displayed raw HTTP request matches the
-# UA mode the user picked in the form (Chrome / Firefox / custom / etc.).
+# Static User-Agent used by `format_raw_http_request` only when the supplied
+# request_headers dict has no User-Agent of its own. As of Phase 0 the scan's
+# actual User-Agent is scan-local: `UASession` stamps it into every per-call
+# headers dict (and therefore into each Finding's request_headers), so the
+# displayed raw HTTP request matches what was transmitted without relying on
+# process-global state. This constant is no longer mutated per-scan; the
+# setter/getter below remain for backward compatibility.
 _DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -28,11 +74,11 @@ _DEFAULT_USER_AGENT = (
 
 
 def set_default_user_agent(ua: str) -> None:
-    """Set the User-Agent used as the fallback by `format_raw_http_request`.
+    """Set the static User-Agent fallback used by `format_raw_http_request`.
 
-    Called by `UASession` at scan start (static UA modes) and on every
-    outbound request (random rotation) so the raw_request displayed in the
-    dashboard matches what was actually transmitted.
+    Deprecated for per-scan use: the scan's UA is now carried by per-request
+    headers. This setter remains for backward compatibility with external
+    callers.
     """
     global _DEFAULT_USER_AGENT
     if ua:
@@ -159,6 +205,19 @@ class Finding:
     # Auto-populated from method/request_url/request_headers/request_body in
     # __post_init__ if the emitter doesn't supply one explicitly.
     raw_request: str = ""
+    # Phase 0: expanded evidence/safety/confidence metadata. All optional and
+    # backward compatible -- legacy emitters and report fields keep working.
+    confidence: str = ""
+    owasp_api: str = ""
+    cwe: str = ""
+    auth_profile: str = ""
+    baseline_summary: str = ""
+    comparison_summary: str = ""
+    safety_level: str = ""
+    check_id: str = ""
+    # Phase 0: index of the request ledger entry this finding was produced from.
+    ledger_index: Optional[int] = None
+    redacted_fields: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.raw_request:
@@ -166,7 +225,40 @@ class Finding:
                 self.method, self.request_url, self.request_headers, self.request_body
             )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, redaction: Optional[RedactionConfig] = None) -> Dict[str, Any]:
+        """Return a JSON-serializable dict, redacted by default.
+
+        Authorization, cookies, API keys, tokens, and configured sensitive
+        JSON paths are redacted unless a non-default ``redaction`` config
+        disables it. The raw HTTP request blob is rebuilt from the redacted
+        fields so no secret leaks through it. Use :meth:`to_raw_dict` for the
+        separately labeled exact-raw opt-in.
+        """
+        data = asdict(self)
+        cfg = redaction if redaction is not None else DEFAULT_REDACTION_CONFIG
+        if not cfg.enabled:
+            return data
+        headers, header_fields = redact_headers(data.get("request_headers") or {}, cfg)
+        data["request_headers"] = headers
+        url, url_fields = redact_url_query(data.get("request_url") or "", cfg)
+        data["request_url"] = url
+        body, body_fields = redact_body_text(data.get("request_body"), cfg)
+        data["request_body"] = body
+        resp, resp_fields = redact_body_text(data.get("response_body"), cfg)
+        data["response_body"] = resp
+        data["raw_request"] = format_raw_http_request(
+            data["method"], data["request_url"], data["request_headers"], data["request_body"]
+        )
+        data["redacted_fields"] = (
+            [f"request_headers.{name}" for name in header_fields]
+            + url_fields
+            + [f"request_body.{name}" for name in body_fields]
+            + [f"response_body.{name}" for name in resp_fields]
+        )
+        return data
+
+    def to_raw_dict(self) -> Dict[str, Any]:
+        """Return the exact, unredacted finding dict (separately labeled opt-in)."""
         return asdict(self)
 
 
@@ -220,13 +312,21 @@ SSRF_PATTERNS = [
     r"ami-id",
     r"computeMetadata",
     r"\"hostname\":",
+    # Multi-cloud / container metadata markers.
+    r"metadata/instance",
+    r"\"imageName\"",
+    r"accounts\.google",
 ]
 
 SENSITIVE_DISCLOSURE_PATTERNS = [
     (r"-----begin (rsa |ec |dsa |openssh )?private key-----", "private key"),
     (r"aws_secret_access_key", "AWS secret"),
     (r"\baws_access_key_id\s*=\s*akia[0-9a-z]{10,}", "AWS access key"),
-    (r"\bbearer\s+[a-z0-9\-_\.=]{20,}", "bearer token"),
+    # FP fix: narrow Bearer regex to avoid matching tokens echoed in
+    # error/validation messages that show what was sent. Require the
+    # token to appear in a JSON value context, not in an echo/debug line.
+    (r'"access_token"\s*:\s*"bearer\s+[a-z0-9\-_\.=]{20,}', "bearer token"),
+    (r'"token"\s*:\s*"bearer\s+[a-z0-9\-_\.=]{20,}', "bearer token"),
     (r"x-amz-security-token", "AWS session token"),
 ]
 
@@ -280,9 +380,25 @@ def _type_juggling_severity(payload: str, technique: str) -> Optional[str]:
     We only flag values that clearly don't match the declared type. Numbers
     that happen to parse cleanly (e.g. ``-1`` against an integer parameter)
     are skipped to keep the report low-noise.
+
+    FP fix: boolean parameters accepting true/false/1/0/yes/no/on/off are
+    suppressed entirely — these are framework conventions, not vulnerabilities.
+    Only unusual boolean values (arrays, objects, quoted strings) are flagged.
     """
     p = (payload or "").strip()
     t = (technique or "").lower()
+    # FP fix: suppress common boolean truthy/falsy values that frameworks
+    # legitimately accept as boolean alternatives. Covers any technique
+    # whose label contains "truthy" or "falsy" (e.g. "HTML-checkbox truthy",
+    # "English truthy string") not just techniques with "boolean" in the name.
+    _BOOLEAN_BENIGN = {"1", "0", "true", "false", "yes", "no", "on", "off", "null", "undefined"}
+    if ("truthy" in t or "falsy" in t or "boolean" in t) and p.lower() in _BOOLEAN_BENIGN:
+        return None
+    # FP fix: suppress benign integer values (1, 0, -1) that are normal
+    # for integer parameters — the server accepting them is expected.
+    _INTEGER_BENIGN = {"1", "0", "-1"}
+    if "integer" in t and p in _INTEGER_BENIGN:
+        return None
     # Numeric category: skip values that parse as a plain int/float (the server
     # accepting `-1` for an integer is normal).
     try:
@@ -345,6 +461,14 @@ def analyze(
     response_time_ms: int,
     baseline_time_ms: Optional[int] = None,
     response_headers: Optional[Dict[str, str]] = None,
+    confidence: Optional[str] = None,
+    check_id: str = "",
+    safety_level: str = "",
+    auth_profile: str = "",
+    # FP fix: anonymous baseline status for differential auth_bypass suppression.
+    anonymous_status: Optional[int] = None,
+    # FP fix: baseline response status for 5xx differential suppression.
+    baseline_status: Optional[int] = None,
 ) -> List[Finding]:
     """Return zero or more Findings for a single request/response."""
     findings: List[Finding] = []
@@ -352,7 +476,9 @@ def analyze(
 
     captured_body, was_truncated = capture_body(response_text)
 
-    def _mk(severity: str, title: str, evidence: str) -> Finding:
+    meta = CATEGORY_META.get(category, {})
+
+    def _mk(severity: str, title: str, evidence: str, confidence: Optional[str] = None) -> Finding:
         return Finding(
             severity=severity,
             category=category,
@@ -372,6 +498,12 @@ def analyze(
             response_body=captured_body,
             response_headers=dict(response_headers or {}),
             response_truncated=was_truncated,
+            confidence=confidence or _severity_to_confidence(severity),
+            owasp_api=meta.get("owasp_api", ""),
+            cwe=meta.get("cwe", ""),
+            safety_level=safety_level or meta.get("safety", SafetyLevel.SAFE_ACTIVE.value),
+            check_id=check_id,
+            auth_profile=auth_profile,
         )
 
     if category == "sql_injection":
@@ -390,6 +522,7 @@ def analyze(
                     "high",
                     "Possible time-based blind SQL injection",
                     f"Response delayed {response_time_ms - baseline_time_ms} ms vs baseline",
+                    confidence=Confidence.MEDIUM.value,
                 )
             )
 
@@ -422,6 +555,7 @@ def analyze(
                     "high",
                     "Possible time-based blind command injection",
                     f"Response delayed {response_time_ms - baseline_time_ms} ms vs baseline",
+                    confidence=Confidence.MEDIUM.value,
                 )
             )
 
@@ -446,14 +580,22 @@ def analyze(
             )
 
     elif category == "auth_bypass":
+        # FP fix: only flag auth_bypass if the endpoint is not public.
+        # If anonymous_status is provided and also 2xx, the endpoint is likely
+        # public and accepting any credential is not a bypass.
         if 200 <= status_code < 300:
-            findings.append(
-                _mk(
-                    "high",
-                    "Possible auth bypass: success status with weak credential",
-                    f"HTTP {status_code} returned for payload '{payload!r}'",
+            if anonymous_status is not None and 200 <= anonymous_status < 300:
+                # Anonymous also gets 2xx — endpoint is public, not a bypass.
+                pass
+            else:
+                findings.append(
+                    _mk(
+                        "high",
+                        "Possible auth bypass: success status with weak credential",
+                        f"HTTP {status_code} returned for payload '{payload!r}' (anonymous: {anonymous_status})",
+                        confidence=Confidence.LOW.value,
+                    )
                 )
-            )
 
     elif category == "info_disclosure":
         hit = _first_match(body_lc, STACK_TRACE_PATTERNS)
@@ -478,6 +620,7 @@ def analyze(
                     "high",
                     "Possible time-based blind NoSQL injection",
                     f"Response delayed {response_time_ms - baseline_time_ms} ms vs baseline",
+                    confidence=Confidence.MEDIUM.value,
                 )
             )
         elif 200 <= status_code < 300 and parameter and "$ne" in payload:
@@ -486,6 +629,21 @@ def analyze(
                     "medium",
                     "Operator smuggling returned 200 \u2014 verify auth/filter bypass",
                     f"NoSQL operator payload accepted with HTTP {status_code}",
+                    confidence=Confidence.LOW.value,
+                )
+            )
+
+    elif category == "ssi_injection":
+        # SSI evaluation manifests like command injection (exec) or file
+        # disclosure (include). Reuse command-output patterns plus an
+        # SSI-unparsed marker for partial evaluation.
+        hit = _first_match(body_lc, COMMAND_OUTPUT_PATTERNS + PATH_TRAVERSAL_PATTERNS)
+        if hit:
+            findings.append(
+                _mk(
+                    "critical",
+                    "SSI injection: server-side include evaluated",
+                    f"Matched: {hit}",
                 )
             )
 
@@ -567,18 +725,30 @@ def analyze(
     for pat, label in SENSITIVE_DISCLOSURE_PATTERNS:
         if re.search(pat, body_lc):
             findings.append(
-                _mk("critical", f"Sensitive data disclosed: {label}", f"Pattern matched: {label}")
+                _mk(
+                    "critical",
+                    f"Sensitive data disclosed: {label}",
+                    f"Pattern matched: {label}",
+                    confidence=Confidence.CONFIRMED.value,
+                )
             )
 
     # Generic 5xx for any category — useful low-noise signal.
+    # FP fix: only flag 5xx if the benign baseline didn't also produce 5xx.
+    # If baseline_status is provided and also 5xx, the 5xx is likely
+    # background server instability, not payload-induced.
     if 500 <= status_code < 600 and not findings:
-        findings.append(
-            _mk(
-                "low",
-                f"Server error (HTTP {status_code}) triggered by payload",
-                "Payload caused 5xx; investigate for unhandled exception path",
+        if baseline_status is not None and 500 <= baseline_status < 600:
+            # Baseline also produced 5xx — not payload-induced.
+            pass
+        else:
+            findings.append(
+                _mk(
+                    "low",
+                    f"Server error (HTTP {status_code}) triggered by payload",
+                    "Payload caused 5xx; investigate for unhandled exception path",
+                )
             )
-        )
 
     return findings
 

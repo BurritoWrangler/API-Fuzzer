@@ -31,6 +31,17 @@
     </div>
 
     <fieldset class="field">
+      <legend>Payload obfuscation (WAF evasion, v1.10)</legend>
+      <select name="payload_obfuscation" id="payload_obfuscation">
+        {% set selected_obf = prev_payload_obfuscation or 'off' %}
+        {% for slug, label in obfuscation_modes.items() %}
+        <option value="{{ slug }}" {% if selected_obf == slug %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <span class="hint">Picks a per-category transform stack (random case, SQL inline comments, IFS substitution, URL/HTML encoding) so payloads slip past Cloudflare / AWS WAF / ModSecurity rules. Use <em>Random</em> when you need every request to look different.</span>
+    </fieldset>
+
+    <fieldset class="field">
       <legend>User-Agent</legend>
       <div class="row">
         <div class="field" style="margin-bottom:0">
@@ -81,11 +92,14 @@
     <fieldset class="field">
       <legend>Vulnerability classes</legend>
       <div class="checks scan-options">
+        {# v1.10 bugfix: previously {% if prev_categories is none %} — but on a
+           fresh GET / the variable is *undefined* (not None), so no checkbox
+           was pre-checked. Treat undefined OR explicit None as "first load". #}
         {% for slug, label in categories %}
           {% if slug != 'misconfiguration' %}
           <label class="check">
             <input type="checkbox" name="categories" value="{{ slug }}"
-                   {% if prev_categories is none or slug in prev_categories %}checked{% endif %}>
+                   {% if (prev_categories is not defined) or (prev_categories is none) or (slug in prev_categories) %}checked{% endif %}>
             <span>{{ label }}</span>
           </label>
           {% endif %}

@@ -104,7 +104,37 @@
 
   const SEV_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
 
+  // -----------------------------------------------------------------------
+  // Stateful rendering: preserve expanded finding rows across the 1.2s poll.
+  //
+  // openRows holds the keys of findings the user has expanded. Each <details>
+  // carries a stable data-key; before every re-render we sync the set with
+  // the live DOM (open -> add, collapsed -> delete) so user collapses are
+  // respected and re-renders restore the same rows.
+  // -----------------------------------------------------------------------
+  const openRows = new Set();
+  let lastFindingsData = null;   // cached findings for instant filter/sort
+  let lastFindingsCount = -1;
+  let lastPollStatus = null;
+
+  function findingKey(f) {
+    // Stable identity independent of list order or polling round.
+    return [f.title, f.severity, f.endpoint, f.method, f.parameter, f.location, f.payload]
+      .join('|');
+  }
+
+  function captureOpenState() {
+    document.querySelectorAll('#findings details[data-key]').forEach(function (el) {
+      if (el.open) {
+        openRows.add(el.dataset.key);
+      } else {
+        openRows.delete(el.dataset.key);
+      }
+    });
+  }
+
   function renderFindings(findings) {
+    captureOpenState();
     const container = document.getElementById('findings');
     const empty = document.getElementById('empty');
     const filter = document.getElementById('sev-filter').value;
@@ -135,8 +165,10 @@
       const truncatedNote = f.response_truncated
         ? ` <span class="muted">(truncated at 1\u00A0MiB)</span>` : '';
       const rawId = `raw-req-${idx}`;
+      const key = findingKey(f);
+      const isOpen = openRows.has(key) ? ' open' : '';
       return `
-        <details class="finding sev-${escapeHtml(f.severity)}">
+        <details class="finding sev-${escapeHtml(f.severity)}" data-key="${escapeHtml(key)}"${isOpen}>
           <summary>
             <span class="badge sev-${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
             <span class="finding-title">${escapeHtml(f.title)}</span>
@@ -236,8 +268,24 @@
       const resp = await fetch(`/scan/${SCAN_ID}/status`);
       if (!resp.ok) return;
       const data = await resp.json();
+      const findings = data.findings || [];
+      // Only rebuild the findings DOM when something actually changed:
+      //  - the first successful poll
+      //  - new findings arrived (count grew)
+      //  - the scan just completed (the backend dedupes + re-sorts the list
+      //    at completion, so the order/count can change without new items)
+      // Otherwise leave the DOM untouched so expanded rows stay expanded.
+      const completedTransition = data.status === 'completed' && lastPollStatus !== 'completed';
+      const needsRender = lastFindingsData === null
+        || findings.length !== lastFindingsCount
+        || completedTransition;
+      lastFindingsData = findings;
+      lastFindingsCount = findings.length;
+      lastPollStatus = data.status;
       applySnapshot(data);
-      renderFindings(data.findings || []);
+      if (needsRender) {
+        renderFindings(lastFindingsData);
+      }
       if (data.status === 'running' || data.status === 'pending') {
         setTimeout(poll, 1200);
       }
@@ -249,9 +297,11 @@
   function _onFilterOrSortChange() {
     if (EMBED) {
       renderFindings(INITIAL_FINDINGS || []);
+    } else if (lastFindingsData !== null) {
+      // Re-render instantly from the cached findings; the next poll keeps
+      // working normally. Open-state is preserved by renderFindings.
+      renderFindings(lastFindingsData);
     } else {
-      // We don't have a cached copy of findings in non-embed mode, so just
-      // re-run the poll which will re-render with the new sort/filter.
       poll();
     }
   }

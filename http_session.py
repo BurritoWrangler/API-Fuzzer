@@ -110,14 +110,12 @@ class UASession(requests.Session):
         # will inject it into every outbound request.
         initial_ua = self._static_ua or self._pick_ua()
         self.headers["User-Agent"] = initial_ua
-        # Push the active UA into analyzer's raw_request fallback so every
-        # Finding's displayed "Raw HTTP request" pane shows the actual UA
-        # the server saw, not the old hardcoded "apifuzz".
-        try:
-            from analyzer import set_default_user_agent
-            set_default_user_agent(initial_ua)
-        except Exception:  # pragma: no cover - analyzer is always importable
-            pass
+        # Phase 0: the scan's User-Agent is scan-local. It is stamped into the
+        # session header above AND into every per-call headers dict in
+        # ``request`` so it lands in each Finding's request_headers (and the
+        # raw_request blob). We no longer mutate analyzer's process-global
+        # fallback per scan, which avoids races between concurrent scans with
+        # different UA modes.
 
     def _initial_static_ua(self) -> Optional[str]:
         if self.ua_mode == "custom":
@@ -136,14 +134,6 @@ class UASession(requests.Session):
         # Keep the session-level header in sync so plain merging works (this
         # matters for random mode where each call picks a fresh UA).
         self.headers["User-Agent"] = ua
-        # Also keep the analyzer's fallback in sync so raw_request panes for
-        # findings whose request_headers don't include UA still display
-        # something realistic instead of "apifuzz".
-        try:
-            from analyzer import set_default_user_agent
-            set_default_user_agent(ua)
-        except Exception:  # pragma: no cover
-            pass
         headers = kwargs.get("headers")
         if headers is None:
             kwargs["headers"] = {"User-Agent": ua}

