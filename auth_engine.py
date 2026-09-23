@@ -28,6 +28,7 @@ from authorization_checks import (
     marker_value_for_property,
     plan_identifier_mutations,
 )
+from id_enrichment import enrich_candidates
 from models import AuthProfile, SafetyLevel
 from request_builder import build_encoded_url
 from spec_parser import Endpoint
@@ -91,9 +92,19 @@ def _send_profiled(
     method_override: Optional[str] = None,
     path_override: Optional[str] = None,
     body_override: Optional[Any] = None,
+    param_overrides: Optional[Dict[str, Any]] = None,
 ) -> Optional[requests.Response]:
-    """Send a request as a specific identity, returning the raw response."""
+    """Send a request as a specific identity, returning the raw response.
+
+    ``param_overrides`` maps parameter names to replacement values and is
+    applied to whichever location the named parameter occupies (path, query,
+    header, or top-level body field). This is how BOLA probes substitute a
+    learned object identifier into the attacker's request.
+    """
     method = (method_override or endpoint.method).upper()
+    overrides = param_overrides or {}
+    param_locations = {p.name: p.location for p in endpoint.parameters}
+
     path_params = {
         p.name: p.example if p.example is not None else 1
         for p in endpoint.parameters
@@ -105,6 +116,21 @@ def _send_profiled(
     for p in endpoint.parameters:
         if p.location == "header":
             headers[p.name] = str(p.example if p.example is not None else "test")
+
+    # Apply overrides by parameter location.
+    body_override_applied = body_override is not None
+    for name, value in overrides.items():
+        location = param_locations.get(name)
+        if location == "path":
+            path_params[name] = value
+        elif location == "query":
+            query[name] = value
+        elif location == "header":
+            headers[name] = str(value)
+        elif location == "body" and not body_override_applied:
+            # Apply to a copied body below; mark so body_override wins if both given.
+            body_override_applied = False  # handled via _body_patch below
+
     url = build_encoded_url(base_url, path, path_params, query)
     try:
         kwargs: Dict[str, Any] = {
@@ -116,6 +142,11 @@ def _send_profiled(
         body = body_override if body_override is not None else (
             copy.deepcopy(endpoint.body_example) if endpoint.has_body else None
         )
+        if body is not None and not body_override_applied:
+            # Apply body-located overrides to the copied body.
+            for name, value in overrides.items():
+                if param_locations.get(name) == "body" and isinstance(body, dict):
+                    body[name] = value
         if body is not None:
             kwargs["json"] = body
         return session.request(method, url, **kwargs)
@@ -176,6 +207,10 @@ def run_bola_probes(
         if not candidates:
             continue
 
+        # ID enrichment: decode base64/hex-encoded integers and detect UUIDv1
+        # identifiers so obfuscated IDs can still be enumerated.
+        candidates = enrich_candidates(candidates)
+
         mutations = plan_identifier_mutations(ep, candidates, target_profile=attacker.name)
         if not mutations:
             continue
@@ -193,9 +228,13 @@ def run_bola_probes(
             if probe_count >= cfg.max_bola_probes:
                 break
             probe_count += 1
-            # Send attacker request with the owner's identifier substituted.
+            # Send attacker request with the owner's identifier substituted
+            # into the parameter location the mutation targets. Previously the
+            # mutation was computed but never applied, so the probe compared
+            # the owner's response against the attacker's *benign* response.
             attacker_resp = _send_profiled(
                 session, ep, base_url, attacker, timeout,
+                param_overrides={mutation.parameter: mutation.value},
             )
             if attacker_resp is None:
                 continue

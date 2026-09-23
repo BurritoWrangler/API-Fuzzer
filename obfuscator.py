@@ -66,6 +66,12 @@ _SQL_KEYWORDS = [
     "SLEEP", "WAITFOR", "BENCHMARK", "CONCAT", "CONVERT", "EXTRACTVALUE",
 ]
 
+# Pre-compile once at import: sql_inline_comments runs per payload, and
+# recompiling 21 patterns per payload dominated obfuscation CPU time.
+_SQL_KEYWORD_PATTERNS = [
+    re.compile(r"\b" + kw + r"\b", re.IGNORECASE) for kw in _SQL_KEYWORDS
+]
+
 
 def sql_inline_comments(payload: str) -> str:
     """Split SQL keywords with /**/ inline comments and replace spaces.
@@ -74,8 +80,7 @@ def sql_inline_comments(payload: str) -> str:
     parsing as valid SQL on MySQL, PostgreSQL, MSSQL, Oracle.
     """
     out = payload
-    for kw in _SQL_KEYWORDS:
-        pattern = re.compile(r"\b" + kw + r"\b", re.IGNORECASE)
+    for pattern in _SQL_KEYWORD_PATTERNS:
 
         def split(m):
             w = m.group(0)

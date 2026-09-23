@@ -90,6 +90,44 @@ def test_concurrent_scan_limit_is_enforced(monkeypatch):
     assert CapturingThread.created == []
 
 
+def test_dashboard_renders_stateful_finding_rows():
+    """The results dashboard must include the stateful-render markers so
+    expanded finding rows survive the 1.2s polling re-render."""
+    from analyzer import Finding
+
+    state = ScanState(scan_id="dash123")
+    state.status = "completed"
+    state.findings.append(
+        Finding(
+            severity="high",
+            category="sql_injection",
+            title="SQL error disclosed in response",
+            endpoint="/users",
+            method="GET",
+            parameter="q",
+            location="query",
+            payload="' OR 1=1",
+            technique="boolean tautology",
+            evidence="Matched signature: sql syntax",
+            status_code=200,
+            response_time_ms=12,
+            request_url="https://api.example/users?q=1",
+        )
+    )
+    with webapp.SCANS_LOCK:
+        webapp.SCANS["dash123"] = state
+    client = webapp.app.test_client()
+
+    response = client.get("/scan/dash123")
+
+    assert response.status_code == 200
+    html = response.data.decode("utf-8")
+    assert "data-key=" in html
+    assert "openRows" in html
+    assert "captureOpenState" in html
+    assert "completedTransition" in html
+
+
 def test_terminal_scans_are_pruned_after_ttl(monkeypatch):
     monkeypatch.setattr(webapp, "SCAN_TTL_SECONDS", 60)
     with webapp.SCANS_LOCK:

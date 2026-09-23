@@ -38,6 +38,7 @@ CATEGORY_META: Dict[str, Dict[str, str]] = {
     "xpath_injection": {"owasp_api": "API3:2023", "cwe": "CWE-643", "safety": "safe_active"},
     "prototype_pollution": {"owasp_api": "API3:2023", "cwe": "CWE-1321", "safety": "safe_active"},
     "open_redirect": {"owasp_api": "API3:2023", "cwe": "CWE-601", "safety": "safe_active"},
+    "ssi_injection": {"owasp_api": "API3:2023", "cwe": "CWE-97", "safety": "safe_active"},
     "type_juggling": {"owasp_api": "API3:2023", "cwe": "CWE-843", "safety": "safe_active"},
 }
 
@@ -311,6 +312,10 @@ SSRF_PATTERNS = [
     r"ami-id",
     r"computeMetadata",
     r"\"hostname\":",
+    # Multi-cloud / container metadata markers.
+    r"metadata/instance",
+    r"\"imageName\"",
+    r"accounts\.google",
 ]
 
 SENSITIVE_DISCLOSURE_PATTERNS = [
@@ -625,6 +630,20 @@ def analyze(
                     "Operator smuggling returned 200 \u2014 verify auth/filter bypass",
                     f"NoSQL operator payload accepted with HTTP {status_code}",
                     confidence=Confidence.LOW.value,
+                )
+            )
+
+    elif category == "ssi_injection":
+        # SSI evaluation manifests like command injection (exec) or file
+        # disclosure (include). Reuse command-output patterns plus an
+        # SSI-unparsed marker for partial evaluation.
+        hit = _first_match(body_lc, COMMAND_OUTPUT_PATTERNS + PATH_TRAVERSAL_PATTERNS)
+        if hit:
+            findings.append(
+                _mk(
+                    "critical",
+                    "SSI injection: server-side include evaluated",
+                    f"Matched: {hit}",
                 )
             )
 

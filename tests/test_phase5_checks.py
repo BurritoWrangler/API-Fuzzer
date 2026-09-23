@@ -124,7 +124,16 @@ def test_grpc_adapter_gated_on_capability():
         assert findings == []
 
 
-def test_soap_adapter_always_returns_metadata():
-    findings = protocol_adapters.probe_soap_wsdl("https://api.example/soap")
+def test_soap_adapter_wsdl_detection():
+    """SOAP adapter exposes WSDL when the definition document is served."""
+    session = FakeSession(lambda m, u, k: FakeResponse(200, "<wsdl:definitions></wsdl:definitions>"))
+    findings = protocol_adapters.probe_soap_wsdl("https://api.example/soap", session, timeout=5)
     assert len(findings) == 1
     assert findings[0].protocol == "soap"
+    assert findings[0].confidence == "strong"
+
+
+def test_soap_adapter_clean_when_wsdl_absent():
+    session = FakeSession(lambda m, u, k: FakeResponse(404, "not found"))
+    findings = protocol_adapters.probe_soap_wsdl("https://api.example/soap", session, timeout=5)
+    assert findings == []

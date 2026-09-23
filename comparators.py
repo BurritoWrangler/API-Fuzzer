@@ -166,6 +166,41 @@ def _canonical_body(
     return text, "text"
 
 
+# Cap the text fed into difflib.SequenceMatcher. The ratio is only needed
+# near the equivalence threshold; comparing the first 64 KiB per side keeps
+# the O(n*m) matcher bounded for 1 MiB response bodies.
+_SIMILARITY_SAMPLE_BYTES = 65536
+
+
+def _response_similarity(
+    baseline_text: str,
+    candidate_text: str,
+    *,
+    body_equal: bool,
+    shape_equal: bool,
+) -> float:
+    """Compute body similarity with fast paths that avoid quadratic cost.
+
+    * Equal bodies score 1.0 without invoking difflib.
+    * When shapes already differ (or either body is empty) the ratio cannot
+      plausibly reach ~0.97 for structured data, so return a cheap
+      length-based estimate instead of running the matcher.
+    * Otherwise compare at most the first _SIMILARITY_SAMPLE_BYTES per side.
+    """
+    if body_equal:
+        return 1.0
+    if not baseline_text or not candidate_text:
+        return 0.0
+    if not shape_equal:
+        # Different JSON shapes: the length ratio bounds similarity well
+        # below any reasonable equivalence threshold.
+        shorter, longer = sorted((len(baseline_text), len(candidate_text)))
+        return (shorter / longer) * 0.5 if longer else 0.0
+    sample_baseline = baseline_text[:_SIMILARITY_SAMPLE_BYTES]
+    sample_candidate = candidate_text[:_SIMILARITY_SAMPLE_BYTES]
+    return difflib.SequenceMatcher(None, sample_baseline, sample_candidate).ratio()
+
+
 def compare_http_responses(
     *,
     baseline_status: int,
@@ -194,11 +229,14 @@ def compare_http_responses(
         volatile_keys=volatile_keys,
     )
 
-    similarity = difflib.SequenceMatcher(None, baseline_text, candidate_text).ratio()
     status_equal = baseline_status == candidate_status
     content_type_equal = baseline_type == candidate_type
     body_equal = baseline_text == candidate_text
     shape_equal = baseline_shape == candidate_shape
+    similarity = _response_similarity(
+        baseline_text, candidate_text, body_equal=body_equal,
+        shape_equal=shape_equal,
+    )
     equivalent = (
         status_equal
         and content_type_equal

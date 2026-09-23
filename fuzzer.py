@@ -272,6 +272,72 @@ def _benign_request(endpoint: Endpoint, cfg: ScanConfig):
     return prepared.url, dict(prepared.headers), dict(prepared.query_params), template.body
 
 
+def _anonymous_baseline(
+    session: requests.Session,
+    endpoint: Endpoint,
+    cfg: ScanConfig,
+    scan: Optional[ScanState] = None,
+) -> Dict[str, Any]:
+    """Run a benign request with no Authorization header.
+
+    Used to suppress auth_bypass false positives: if the anonymous request
+    also succeeds (2xx), the endpoint is public and weak credentials are not
+    a bypass. The result shape matches _baseline_request.
+    """
+    out: Dict[str, Any] = {
+        "latency_ms": None,
+        "status_code": 0,
+        "response_headers": {},
+        "set_cookies": [],
+        "url": "",
+        "error": None,
+    }
+    prepared: Optional[PreparedRequest] = None
+    try:
+        template = _endpoint_template(endpoint, cfg)
+        template.auth_profile = None  # strip Authorization
+        prepared = build_request(template)
+        out["url"] = prepared.url
+        kwargs: Dict[str, Any] = {
+            "headers": prepared.headers,
+            "params": prepared.query_params or None,
+            "timeout": cfg.timeout,
+            "allow_redirects": False,
+        }
+        if endpoint.has_body and prepared.body is not None:
+            kwargs["data"] = prepared.body
+        t0 = time.perf_counter()
+        resp = session.request(method=endpoint.method, url=prepared.url, **kwargs)
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        out["latency_ms"] = elapsed
+        out["status_code"] = resp.status_code
+        out["response_headers"] = dict(resp.headers)
+        out["set_cookies"] = misconfig.extract_set_cookies(resp)
+        _ledger(
+            scan,
+            prepared=prepared,
+            status_code=resp.status_code,
+            latency_ms=elapsed,
+            check_id="baseline_anonymous",
+            safety_level=SafetyLevel.PASSIVE.value,
+            outcome=RequestLedger.OUTCOME_SUCCEEDED,
+        )
+    except requests.exceptions.RequestException as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        _ledger(
+            scan,
+            prepared=prepared,
+            status_code=0,
+            error=str(exc),
+            check_id="baseline_anonymous",
+            safety_level=SafetyLevel.PASSIVE.value,
+            outcome=RequestLedger.OUTCOME_FAILED,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def _inject(value: Any, payload: str) -> str:
     return payload  # full replacement strategy
 
@@ -592,6 +658,15 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
 
             baseline_ms = baseline["latency_ms"]
 
+            # FP fix: anonymous baseline for auth_bypass differential. Only
+            # needed when auth is configured and the auth_bypass category is
+            # selected; one extra passive request per endpoint.
+            anonymous_status: Optional[int] = None
+            if cfg.auth_header and "auth_bypass" in cfg.categories:
+                anon_base = _anonymous_baseline(session, ep, cfg, scan)
+                if not anon_base["error"]:
+                    anonymous_status = anon_base["status_code"]
+
             # --- Extended request-mutation checks (once per endpoint) -----
             benign_query = {p.name: _placeholder_value(p) for p in ep.parameters if p.location == "query"}
             if safety_allowed(SafetyLevel.SAFE_ACTIVE.value, scan_mode):
@@ -750,6 +825,9 @@ def run_scan(scan: ScanState, endpoints: List[Endpoint], cfg: ScanConfig) -> Non
                                 check_id=category,
                                 safety_level=SafetyLevel.SAFE_ACTIVE.value,
                                 auth_profile="default" if cfg.auth_header else "anonymous",
+                                # FP fix: differential suppression inputs.
+                                baseline_status=baseline["status_code"],
+                                anonymous_status=anonymous_status,
                             )
                             _record(scan, *findings)
                             entry = _ledger(

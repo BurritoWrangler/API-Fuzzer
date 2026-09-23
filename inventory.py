@@ -8,6 +8,7 @@ exposure (a reachable but undocumented endpoint) from confirmed vulnerability
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -39,14 +40,22 @@ def _normalize_path(path: str) -> str:
     return normalized.lower()
 
 
+_TEMPLATE_PARAM_RE = re.compile(r"\{[^}]+\}")
+
+_UUID_SEGMENT_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+_INT_SEGMENT_RE = re.compile(r"^\d+$")
+_LONG_HASH_SEGMENT_RE = re.compile(r"^[0-9a-fA-F]{16,}$")
+
+
 def _path_template_to_regex(template: str) -> str:
     """Convert an OpenAPI path template to a comparison key.
 
     ``/users/{id}/posts`` -> ``/users/{param}/posts``
     """
-    import re
-
-    return re.sub(r"\{[^}]+\}", "{param}", template)
+    return _TEMPLATE_PARAM_RE.sub("{param}", template)
 
 
 def _normalize_concrete_path(path: str) -> str:
@@ -56,19 +65,14 @@ def _normalize_concrete_path(path: str) -> str:
     ``{param}`` so ``/users/42`` matches the documented template
     ``/users/{param}``.
     """
-    import re
-
-    uuid_re = re.compile(
-        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
-        r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
-    )
-    int_re = re.compile(r"^\d+$")
-    long_hash_re = re.compile(r"^[0-9a-fA-F]{16,}$")
-
     parts = path.strip("/").split("/")
     normalized: list = []
     for part in parts:
-        if uuid_re.match(part) or int_re.match(part) or long_hash_re.match(part):
+        if (
+            _UUID_SEGMENT_RE.match(part)
+            or _INT_SEGMENT_RE.match(part)
+            or _LONG_HASH_SEGMENT_RE.match(part)
+        ):
             normalized.append("{param}")
         else:
             normalized.append(part)

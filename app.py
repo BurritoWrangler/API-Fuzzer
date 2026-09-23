@@ -15,6 +15,7 @@ import csv
 import io
 import os
 import threading
+import time
 import uuid
 from typing import Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -83,8 +84,6 @@ def _prune_scans_locked(now: Optional[float] = None) -> None:
 
     The caller must hold ``SCANS_LOCK``.
     """
-    import time
-
     current = time.time() if now is None else now
     expired = [
         scan_id
